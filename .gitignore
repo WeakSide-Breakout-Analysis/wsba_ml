@@ -1,0 +1,6 @@
+simulation/games/
+simulation/plots/
+team_data/
+__pycache__/
+**/__pycache__/
+game_score/*.pkl
