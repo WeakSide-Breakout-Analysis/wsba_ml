@@ -3,17 +3,14 @@ import pandas as pd
 import numpy as np
 import sys
 import math
+import json
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from wsba_core.nhl_obj import NHLTeam
-from wsba_core.simulation import (
-    predict_single_shot,
-    load_team_from_roster_csv,
-    XG_FEATURE_INDEX,
-    XG_FEATURE_COUNT,
-    _load_xg_model,
-)
-from wsba_core.wsba_core import _load_rapm_context_coefficients
+from functools import lru_cache
+from pathlib import Path
+import scipy.sparse as sp
+import xgboost as xgb
+from wsba_ml.nhl_obj import NHLTeam
 from wsba_ml.rapm import decode_rapm_map, rink_grid_format, MAP_X, MAP_Y, MAP_SHAPE, MAP_SIZE
 
 ### WSBA NHL Simulator ###
@@ -37,9 +34,42 @@ EN_EXPECTED_GOALS = GOALS_PER_FENWICK * EN_FENWICK
 
 PENALTIES = 3.0702651883385172
 
-FENWICK_GRID = pd.read_csv('wsba_ml/simulation/sim_data/league_fenwick_grid.csv')
+RAPM_CONTEXT_PREDICTORS = {
+    'period_2',
+    'period_3',
+    'period_4',
+    'offensive_faceoff',
+    'defensive_faceoff',
+    'lead_1',
+    'lead_2',
+    'lead_3_plus',
+    'behind_1',
+    'behind_2',
+    'behind_3_plus',
+    'shift_length',
+    'power_play_expiry',
+    'penalty_kill_expiry',
+    'is_home',
+    'strength_3v3',
+    'strength_4v4',
+    'strength_4v3',
+    'strength_5v3',
+}
+XG_FEATURE_NAMES = tuple(wsba.CONTINUOUS + wsba.BOOLEAN)
+XG_FEATURE_INDEX = {name: idx for idx, name in enumerate(XG_FEATURE_NAMES)}
+XG_FEATURE_COUNT = len(XG_FEATURE_NAMES)
+XG_MODEL_DIR = Path(__file__).resolve().parent / 'xg_model'
+SIM_DATA_DIR = Path(__file__).resolve().parent / 'simulation' / 'sim_data'
+XG_MODEL_FILES = {
+    'ev': 'wsba_xg_ev.json',
+    'pp': 'wsba_xg_pp.json',
+    'pk': 'wsba_xg_pk.json',
+    'en': 'wsba_xg_en.json',
+}
+
+FENWICK_GRID = pd.read_csv(SIM_DATA_DIR / 'league_fenwick_grid.csv')
 FENWICK_GRID['value'] = FENWICK_GRID['value'] / 3600
-GOALIE_PULL_CURVE = pd.read_csv('wsba_ml/simulation/sim_data/goalie_pull_curve.csv')
+GOALIE_PULL_CURVE = pd.read_csv(SIM_DATA_DIR / 'goalie_pull_curve.csv')
 
 STRENGTHS_MATCH = {
     'even_strength': 'ev',
@@ -85,6 +115,98 @@ GOALIE_PULL_MIN_START_SECOND = min(
     second for second in GOALIE_PULL_START_SECOND.values()
     if second is not None
 )
+
+
+def _xg_model_key(strength_state='even_strength', empty_net=False, rate_key=None):
+    if empty_net:
+        return 'en'
+    if rate_key in {'ev', 'pp', 'pk'}:
+        return rate_key
+    strength_label = wsba.STRENGTH_MAP.get(strength_state, 'even_strength')
+    return STRENGTHS_MATCH.get(strength_label, 'ev')
+
+
+def _resolve_xg_model_path(model_key='ev'):
+    model_file = XG_MODEL_FILES.get(model_key, XG_MODEL_FILES['ev'])
+    model_path = XG_MODEL_DIR / model_file
+    if not model_path.exists():
+        raise FileNotFoundError(f'WSBA xG model not found: {model_path}')
+    return model_path
+
+
+@lru_cache(maxsize=4)
+def _load_xg_features(model_key='ev'):
+    model_path = _resolve_xg_model_path(model_key)
+    feature_path = model_path.with_name(model_path.name.replace('.json', '_features.json'))
+    if feature_path.exists():
+        return tuple(json.loads(feature_path.read_text()))
+    model = _load_xg_model(model_key)
+    return tuple(model.feature_names or XG_FEATURE_NAMES)
+
+
+@lru_cache(maxsize=4)
+def _load_xg_feature_index(model_key='ev'):
+    return {name: idx for idx, name in enumerate(_load_xg_features(model_key))}
+
+
+@lru_cache(maxsize=4)
+def _load_xg_model(model_key='ev'):
+    booster = xgb.Booster()
+    booster.load_model(str(_resolve_xg_model_path(model_key)))
+    return booster
+
+
+def _build_xg_feature_vector(feature_dict, model_key='ev'):
+    features = _load_xg_features(model_key)
+    feature_index = _load_xg_feature_index(model_key)
+    vector = np.zeros((1, len(features)), dtype=np.float32)
+    for feature_name, value in feature_dict.items():
+        idx = feature_index.get(feature_name)
+        if idx is not None:
+            vector[0, idx] = float(value)
+    return vector, features
+
+
+def predict_single_shot(feature_dict: dict, empty_net: bool = False, model_path: str = wsba.XG_MODEL, model_key: str = 'ev') -> float:
+    if empty_net:
+        model_key = 'en'
+    model = _load_xg_model(model_key)
+    feature_vector, features = _build_xg_feature_vector(feature_dict, model_key)
+    try:
+        return float(model.inplace_predict(feature_vector, validate_features=False)[0])
+    except Exception:
+        dmatrix = xgb.DMatrix(data=sp.csr_matrix(feature_vector), feature_names=list(features))
+        return float(model.predict(dmatrix)[0])
+
+
+def load_team_from_roster_csv(team_abbr, roster_dir=None):
+    if roster_dir is None:
+        roster_dir = Path(__file__).resolve().parent / 'simulation' / 'team_data'
+    else:
+        roster_dir = Path(roster_dir)
+    roster_path = roster_dir / f'{str(team_abbr).lower()}_roster.csv'
+    if not roster_path.exists():
+        raise FileNotFoundError(f'Roster file not found: {roster_path}')
+    return NHLTeam(team_abbr).roster_from_df(pd.read_csv(roster_path))
+
+
+@lru_cache(maxsize=2)
+def _load_rapm_context_coefficients(model_name):
+    model_file = {
+        'even_strength': 'wsba_rapm_even_strength.json',
+        'power_play': 'wsba_rapm_power_play.json',
+    }[model_name]
+    model_path = Path(__file__).resolve().parent / 'rapm' / model_file
+    if not model_path.exists():
+        return {}
+    model_data = json.loads(model_path.read_text())['shift']
+    return {
+        predictor: float(coef)
+        for predictor, coef in zip(model_data['corsi_predictors'], model_data['corsi'])
+        if predictor in RAPM_CONTEXT_PREDICTORS
+    }
+
+
 FAST_CONTEXT_TERMS = {
     'even_strength': _load_rapm_context_coefficients('even_strength'),
     'power_play': _load_rapm_context_coefficients('power_play'),
@@ -246,7 +368,7 @@ def _strength_predictor(model_name, venue, role, home_skaters, away_skaters):
 def _prepare_player_sampler(players, attribute):
     ids = np.array([int(getattr(player, 'player_id', 0) or 0) for player in players], dtype=np.int64)
     weights = np.array(
-        [max(float(getattr(player, attribute, 0) or 0.0), 0.0) for player in players],
+        [_player_event_weight(player, attribute) for player in players],
         dtype=np.float64,
     )
     total = float(weights.sum())
@@ -271,11 +393,18 @@ def _prepare_player_sampler(players, attribute):
     }
 
 
-def _load_cached_xg_model(empty_net):
-    cache_key = bool(empty_net)
+def _player_event_weight(player, attribute):
+    # Event rates describe talent/tendency; projected TOI controls opportunity.
+    rate = max(float(getattr(player, attribute, 0) or 0.0), 0.0)
+    toi = max(float(getattr(player, 'time_on_ice', 0) or 0.0), 0.0)
+    return rate * toi
+
+
+def _load_cached_xg_model(model_key):
+    cache_key = str(model_key)
     model = XG_MODEL_CACHE.get(cache_key)
     if model is None:
-        model = _load_xg_model(str(wsba.XG_MODEL), empty_net=cache_key)
+        model = _load_xg_model(cache_key)
         XG_MODEL_CACHE[cache_key] = model
     return model
 
@@ -362,8 +491,9 @@ def _single_shot_xg(x_adj, y_adj, shooting_venue, strength_state, shooter=None, 
     else:
         features['other-shot'] = 1.0
 
+    model_key = _xg_model_key(strength_state, empty_net=(goalie is None))
     return float(np.clip(
-        predict_single_shot(features, empty_net=(goalie is None), model_path=str(wsba.XG_MODEL)),
+        predict_single_shot(features, empty_net=(goalie is None), model_key=model_key),
         0.0,
         1.0
     ))
@@ -648,9 +778,7 @@ class WSBASimulation:
         penalties_away_rate = float(self.penalties_away) if np.isfinite(self.penalties_away) and self.penalties_away > 0 else 0.0
 
         game_events = [] if save_pbp else None
-        xg_model = _load_cached_xg_model(False)
-        xg_model_empty = _load_cached_xg_model(True)
-        xg_vector = np.zeros((1, XG_FEATURE_COUNT), dtype=np.float32)
+        xg_models = {model_key: _load_cached_xg_model(model_key) for model_key in XG_MODEL_FILES}
 
         def _sample_prepared(prepared, return_player=True):
             if prepared['size'] <= 0:
@@ -669,9 +797,7 @@ class WSBASimulation:
             weights = []
             total = 0.0
             for player in players:
-                weight = float(getattr(player, attribute, 0) or 0.0)
-                if weight < 0.0:
-                    weight = 0.0
+                weight = _player_event_weight(player, attribute)
                 weights.append(weight)
                 total += weight
 
@@ -1170,36 +1296,46 @@ class WSBASimulation:
                 xg_lookup_cache[cache_key] = empty_lookup
                 return empty_lookup
 
-            features = np.zeros((size, XG_FEATURE_COUNT), dtype=np.float32)
+            model_key = _xg_model_key(strength, empty_net=empty_net, rate_key=rate_key)
+            model_features = _load_xg_features(model_key)
+            model_feature_index = _load_xg_feature_index(model_key)
+            features = np.zeros((size, len(model_features)), dtype=np.float32)
             x_vals = sampler['x'].astype(np.float32, copy=False)
             y_vals = sampler['y'].astype(np.float32, copy=False)
             dx_vals = 89.0 - x_vals
 
-            if XG_IDX_EVENT_DISTANCE is not None:
-                features[:, XG_IDX_EVENT_DISTANCE] = np.sqrt((dx_vals * dx_vals) + (y_vals * y_vals))
-            if XG_IDX_EVENT_ANGLE is not None:
-                features[:, XG_IDX_EVENT_ANGLE] = np.degrees(np.arctan2(np.abs(y_vals), np.maximum(1e-9, np.abs(dx_vals))))
-            if XG_IDX_IS_HOME is not None:
-                features[:, XG_IDX_IS_HOME] = float(event_team_venue == 'home')
-            if XG_IDX_EMPTY_NET is not None:
-                features[:, XG_IDX_EMPTY_NET] = float(empty_net)
-            if XG_IDX_OFFWING is not None:
+            idx = model_feature_index.get('event_distance')
+            if idx is not None:
+                features[:, idx] = np.sqrt((dx_vals * dx_vals) + (y_vals * y_vals))
+            idx = model_feature_index.get('event_angle')
+            if idx is not None:
+                features[:, idx] = np.degrees(np.arctan2(np.abs(y_vals), np.maximum(1e-9, np.abs(dx_vals))))
+            idx = model_feature_index.get('is_home')
+            if idx is not None:
+                features[:, idx] = float(event_team_venue == 'home')
+            idx = model_feature_index.get('empty_net')
+            if idx is not None:
+                features[:, idx] = float(empty_net)
+            idx = model_feature_index.get('offwing')
+            if idx is not None:
                 if shooter_hand == 'L':
-                    features[:, XG_IDX_OFFWING] = (y_vals < 0.0).astype(np.float32, copy=False)
+                    features[:, idx] = (y_vals < 0.0).astype(np.float32, copy=False)
                 elif shooter_hand == 'R':
-                    features[:, XG_IDX_OFFWING] = (y_vals >= 0.0).astype(np.float32, copy=False)
+                    features[:, idx] = (y_vals >= 0.0).astype(np.float32, copy=False)
 
-            strength_idx = XG_STRENGTH_FEATURE_IDX.get(strength)
+            strength_idx = model_feature_index.get(f'strength_{strength}')
             if strength_idx is not None:
                 features[:, strength_idx] = 1.0
 
-            shot_type_idx = XG_SHOT_TYPE_FEATURE_IDX.get(shot_type_key)
+            shot_type_idx = model_feature_index.get(shot_type_key)
             if shot_type_idx is not None:
                 features[:, shot_type_idx] = 1.0
-            elif XG_IDX_OTHER_SHOT is not None:
-                features[:, XG_IDX_OTHER_SHOT] = 1.0
+            else:
+                other_idx = model_feature_index.get('other-shot')
+                if other_idx is not None:
+                    features[:, other_idx] = 1.0
 
-            model = xg_model_empty if empty_net else xg_model
+            model = xg_models[model_key]
             predictions = np.clip(
                 model.inplace_predict(features, validate_features=False),
                 0.0,
@@ -1234,29 +1370,39 @@ class WSBASimulation:
                 return cached_prediction
 
             dx = 89.0 - x_adj
-            xg_vector.fill(0.0)
-            if XG_IDX_EVENT_DISTANCE is not None:
-                xg_vector[0, XG_IDX_EVENT_DISTANCE] = math.sqrt((dx * dx) + (y_adj * y_adj))
-            if XG_IDX_EVENT_ANGLE is not None:
-                xg_vector[0, XG_IDX_EVENT_ANGLE] = math.degrees(math.atan2(abs(y_adj), max(1e-9, abs(dx))))
-            if XG_IDX_IS_HOME is not None:
-                xg_vector[0, XG_IDX_IS_HOME] = float(event_team_venue == 'home')
-            if XG_IDX_EMPTY_NET is not None:
-                xg_vector[0, XG_IDX_EMPTY_NET] = float(empty_net)
-            if XG_IDX_OFFWING is not None:
-                xg_vector[0, XG_IDX_OFFWING] = float(offwing)
+            model_key = _xg_model_key(strength, empty_net=empty_net)
+            model_features = _load_xg_features(model_key)
+            model_feature_index = _load_xg_feature_index(model_key)
+            xg_vector = np.zeros((1, len(model_features)), dtype=np.float32)
+            idx = model_feature_index.get('event_distance')
+            if idx is not None:
+                xg_vector[0, idx] = math.sqrt((dx * dx) + (y_adj * y_adj))
+            idx = model_feature_index.get('event_angle')
+            if idx is not None:
+                xg_vector[0, idx] = math.degrees(math.atan2(abs(y_adj), max(1e-9, abs(dx))))
+            idx = model_feature_index.get('is_home')
+            if idx is not None:
+                xg_vector[0, idx] = float(event_team_venue == 'home')
+            idx = model_feature_index.get('empty_net')
+            if idx is not None:
+                xg_vector[0, idx] = float(empty_net)
+            idx = model_feature_index.get('offwing')
+            if idx is not None:
+                xg_vector[0, idx] = float(offwing)
 
-            strength_idx = XG_STRENGTH_FEATURE_IDX.get(strength)
+            strength_idx = model_feature_index.get(f'strength_{strength}')
             if strength_idx is not None:
                 xg_vector[0, strength_idx] = 1.0
 
-            shot_type_idx = XG_SHOT_TYPE_FEATURE_IDX.get(shot_type_key)
+            shot_type_idx = model_feature_index.get(shot_type_key)
             if shot_type_idx is not None:
                 xg_vector[0, shot_type_idx] = 1.0
-            elif XG_IDX_OTHER_SHOT is not None:
-                xg_vector[0, XG_IDX_OTHER_SHOT] = 1.0
+            else:
+                other_idx = model_feature_index.get('other-shot')
+                if other_idx is not None:
+                    xg_vector[0, other_idx] = 1.0
 
-            model = xg_model_empty if empty_net else xg_model
+            model = xg_models[model_key]
             try:
                 prediction = float(model.inplace_predict(xg_vector, validate_features=False)[0])
             except Exception:

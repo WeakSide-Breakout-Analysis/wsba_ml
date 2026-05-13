@@ -21,7 +21,7 @@ DEFAULT_FEATURES = {
     'shifts':{
         ('expected_goals', 'goals', 'corsi', 'fenwick', 'shots', 'penalty_minutes'): [
             'period_2', 'period_3', 'period_4',
-            'offensive_faceoff', 'defensive_faceoff',
+            'offensive_faceoff', 'neutral_faceoff', 'defensive_faceoff',
             'lead_1', 'lead_2', 'lead_3_plus',
             'behind_1', 'behind_2', 'behind_3_plus',
             'offense_back_to_back', 'defense_back_to_back',
@@ -122,7 +122,7 @@ def shift_cols(max_periods):
         'offense_coach', 'defense_coach',
         *[f'{stat}_for' for stat in RAPM_STATS],
         *[f'{stat}_for_per_sixty' for stat in RAPM_STATS],
-        'offensive_faceoff', 'neutral_faceoff', 'defensive_faceoff',
+        'offensive_faceoff', 'neutral_faceoff', 'defensive_faceoff', 'on_the_fly',
         'lead_1', 'lead_2', 'lead_3_plus',
         'behind_1', 'behind_2', 'behind_3_plus',
         'offense_back_to_back', 'defense_back_to_back',
@@ -380,6 +380,7 @@ def orient_perspective(df, strengths, home=True):
     df['offensive_faceoff'] = df[f'{for_team}_offensive_zone_faceoff']
     df['defensive_faceoff'] = df[f'{against_team}_offensive_zone_faceoff']
     df['neutral_faceoff'] = df['neutral_zone_faceoff']
+    df['on_the_fly'] = ((df['offensive_faceoff'] + df['defensive_faceoff'] + df['neutral_faceoff']) == 0).astype(int)
 
     for lead in ['1', '2', '3_plus']:
         df[f'lead_{lead}'] = df[f'{for_team}_lead_{lead}']
@@ -448,12 +449,12 @@ def encode_players(df):
             for pid in defense_arr[i] if pid != 0
         ]
 
-        offense_coach_lists[i] = [
-            f"{offense_coach_arr[i]}_{season_arr[i]}_{offense_team_arr[i]}"
-        ]
-        defense_coach_lists[i] = [
-            f"{defense_coach_arr[i]}_{season_arr[i]}_{defense_team_arr[i]}"
-        ]
+        offense_coach_lists[i] = [f"{offense_coach_arr[i]}_{season_arr[i]}_{offense_team_arr[i]}"]
+        defense_coach_lists[i] = [f"{defense_coach_arr[i]}_{season_arr[i]}_{defense_team_arr[i]}"]
+        for state in ['lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']:
+            if df[state].iloc[i] == 1:
+                offense_coach_lists[i].append(f"{state}_{offense_coach_arr[i]}_{season_arr[i]}_{offense_team_arr[i]}")
+                defense_coach_lists[i].append(f"{state}_{defense_coach_arr[i]}_{season_arr[i]}_{defense_team_arr[i]}")
     
     #Encode to sparse matrices
     mlb_offense = MultiLabelBinarizer(sparse_output=True)
@@ -787,23 +788,22 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
             (pbp['away_pen_count'] > pbp['home_pen_count'])
         ).astype(int)
 
-        #Determine if faceoff occured during shift
+        #Determine if shift started with a faceoff
         pbp['home_zone_code'] = np.where(pbp['event_team_abbr'] == pbp['home_team_abbr'], pbp['zone_code'], np.nan)
         pbp['home_zone_code'] = np.where((pbp['event_team_abbr'] == pbp['away_team_abbr']) & (pbp['zone_code'] == 'O'), 'D', pbp['home_zone_code'])
         pbp['home_zone_code'] = np.where((pbp['event_team_abbr'] == pbp['away_team_abbr']) & (pbp['zone_code'] == 'D'), 'O', pbp['home_zone_code'])
         pbp['home_zone_code'] = np.where(pbp['zone_code'] == 'N', 'N', pbp['home_zone_code'])
+        pbp['shift_start_period'] = pbp.groupby('shift_id')['period'].transform('first')
+        pbp['shift_start_seconds'] = pbp.groupby('shift_id')['seconds_elapsed'].transform('first')
+        pbp['shift_start_faceoff'] = (
+            (pbp['event_type'] == 'faceoff') &
+            (pbp['period'] == pbp['shift_start_period']) &
+            (pbp['seconds_elapsed'] == pbp['shift_start_seconds'])
+        )
 
-        pbp['home_offensive_zone_faceoff'] = ((pbp['event_type'] == 'faceoff') & (pbp['home_zone_code'] == 'O') & 
-                        ((pbp['shift_change'] == 1) | 
-                            ((pbp['seconds_elapsed'] == pbp['seconds_elapsed'].shift()) & (pbp['shift_change'].shift() == 1)))).astype(int)
-
-        pbp['away_offensive_zone_faceoff'] = ((pbp['event_type'] == 'faceoff') & (pbp['home_zone_code'] == 'D') & 
-                        ((pbp['shift_change'] == 1) | 
-                            ((pbp['seconds_elapsed'] == pbp['seconds_elapsed'].shift()) & (pbp['shift_change'].shift() == 1)))).astype(int)
-
-        pbp['neutral_zone_faceoff'] = ((pbp['event_type'] == 'faceoff') & (pbp['home_zone_code'] == 'N') & 
-                    ((pbp['shift_change'] == 1) | 
-                    ((pbp['seconds_elapsed'] == pbp['seconds_elapsed'].shift()) & (pbp['shift_change'].shift() == 1)))).astype(int)
+        pbp['home_offensive_zone_faceoff'] = (pbp['shift_start_faceoff'] & (pbp['home_zone_code'] == 'O')).astype(int)
+        pbp['away_offensive_zone_faceoff'] = (pbp['shift_start_faceoff'] & (pbp['home_zone_code'] == 'D')).astype(int)
+        pbp['neutral_zone_faceoff'] = (pbp['shift_start_faceoff'] & (pbp['home_zone_code'] == 'N')).astype(int)
 
         #Venue stats
         for venue in ['home', 'away']:
@@ -932,7 +932,7 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
         #Drop reference level columns
         sbs = sbs.drop(
             columns=(
-                ['neutral_faceoff', 'tied', 'period_1']
+                ['on_the_fly', 'tied', 'period_1']
                 + ([f'strength_{drop_strength}'] if drop_strength else [])
             ), errors='ignore'
         )
@@ -964,6 +964,16 @@ def classify_strength_state(strengths):
         return "all"
 
 def calc_info(sbs, strengths, shot=False):
+    def normalize_entity_keys(df):
+        df = df.copy()
+        if "player_id" in df.columns:
+            df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+        if "season" in df.columns:
+            df["season"] = pd.to_numeric(df["season"], errors="coerce").astype("Int64")
+        if "team_abbr" in df.columns:
+            df["team_abbr"] = df["team_abbr"].astype("string")
+        return df
+
     if shot:
         shots = sbs[sbs["shooter_id"] != 0]
 
@@ -973,6 +983,7 @@ def calc_info(sbs, strengths, shot=False):
             .reset_index(name="fenwick")
             .rename(columns={"shooter_id": "player_id", "shooter_team_abbr": "team_abbr"})
         )
+        fenwick = normalize_entity_keys(fenwick)
 
         goals = (
             shots[shots["event_type"] == "goal"]
@@ -981,6 +992,7 @@ def calc_info(sbs, strengths, shot=False):
                 .reset_index(name="goals")
                 .rename(columns={"shooter_id": "player_id", "shooter_team_abbr": "team_abbr"})
             )
+        goals = normalize_entity_keys(goals)
 
         xg = (
             shots.groupby(["shooter_id", "season", "shooter_team_abbr"])["expected_goals"]
@@ -988,6 +1000,7 @@ def calc_info(sbs, strengths, shot=False):
             .reset_index(name="expected_goals")
             .rename(columns={"shooter_id": "player_id", "shooter_team_abbr": "team_abbr"})
         )
+        xg = normalize_entity_keys(xg)
 
         passer_rows = []
         for i in range(1, 7):
@@ -1018,6 +1031,7 @@ def calc_info(sbs, strengths, shot=False):
                 secondary_expected_assists=("secondary_xa", "sum"),
             )
         )
+        assist_agg = normalize_entity_keys(assist_agg)
 
         goal_passers = passer_long[passer_long["event_type"] == 'goal']
 
@@ -1028,6 +1042,7 @@ def calc_info(sbs, strengths, shot=False):
                 secondary_assists=("secondary_prob", "sum"),
             )
         )
+        actual_assists = normalize_entity_keys(actual_assists)
 
         assist_agg = assist_agg.merge(
             actual_assists,
@@ -1044,6 +1059,7 @@ def calc_info(sbs, strengths, shot=False):
             .reset_index(name="fenwick_against")
             .rename(columns={"goalie_id": "player_id", "goalie_team_abbr": "team_abbr"})
         )
+        goalie_fenwick = normalize_entity_keys(goalie_fenwick)
 
         goalie_goals = (
             goalie_events[goalie_events["event_type"] == 'goal']
@@ -1052,6 +1068,7 @@ def calc_info(sbs, strengths, shot=False):
             .reset_index(name="goals_against")
             .rename(columns={"goalie_id": "player_id", "goalie_team_abbr": "team_abbr"})
         )
+        goalie_goals = normalize_entity_keys(goalie_goals)
 
         goalie_xg = (
             goalie_events
@@ -1060,6 +1077,7 @@ def calc_info(sbs, strengths, shot=False):
             .reset_index(name="expected_goals_against")
             .rename(columns={"goalie_id": "player_id", "goalie_team_abbr": "team_abbr"})
         )
+        goalie_xg = normalize_entity_keys(goalie_xg)
 
         goalie_result = (
             goalie_fenwick
@@ -1097,6 +1115,7 @@ def calc_info(sbs, strengths, shot=False):
         )
     else:
         strength_state = classify_strength_state(strengths)
+        score_states = ['lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
 
         offense_cols = [f"offense_on_{i}_id" for i in range(1, 7)]
         defense_cols = [f"defense_on_{i}_id" for i in range(1, 7)]
@@ -1118,7 +1137,7 @@ def calc_info(sbs, strengths, shot=False):
             if entity == "player":
                 cols = ["shift_id", "game_id", "season", "shift_length", team_col] + player_cols
             else:
-                cols = ["shift_id", "game_id", "season", "shift_length", team_col, coach_col]
+                cols = ["shift_id", "game_id", "season", "shift_length", team_col, coach_col] + score_states
 
             result = df[cols].copy()
 
@@ -1149,6 +1168,7 @@ def calc_info(sbs, strengths, shot=False):
 
         player_cols = [f"player_{i}" for i in range(1, 7)]
         id_vars = ["shift_id", "game_id", "season", "time_on_ice", "team_abbr", "side", "strength_state"]
+        coach_id_vars = id_vars + score_states
 
         if strength_state in ("even_strength", "all"):
             to_melt = result[result["side"] == "offense"]
@@ -1164,7 +1184,7 @@ def calc_info(sbs, strengths, shot=False):
         ).dropna(subset=["player_id"])
         long = long[long["player_id"] != 0]
 
-        long_coach = to_melt_coach[id_vars + ["coach_name"]].copy()
+        long_coach = to_melt_coach[coach_id_vars + ["coach_name"]].copy()
         long_coach = long_coach.dropna(subset=["coach_name"])
         long_coach = long_coach[long_coach["coach_name"] != 0]
 
@@ -1209,10 +1229,21 @@ def calc_info(sbs, strengths, shot=False):
         agg_coach = aggregate_toi(long_coach, "coach_name", strength_state)
         agg_coach = agg_coach.merge(gp_coach, on="coach_name", how="left")
         agg_coach['season_type'] = 2
+        for state in score_states:
+            state_coach = long_coach.loc[long_coach[state] == 1].copy()
+            state_agg = aggregate_toi(state_coach, "coach_name", strength_state).rename(
+                columns={"time_on_ice": f"{state}_time_on_ice"}
+            )
+            agg_coach = agg_coach.merge(
+                state_agg[["coach_name", "season", "team_abbr", "strength_state", f"{state}_time_on_ice"]],
+                on=["coach_name", "season", "team_abbr", "strength_state"],
+                how="left"
+            )
+            agg_coach[f"{state}_time_on_ice"] = agg_coach[f"{state}_time_on_ice"].fillna(0)
 
         return (
             agg[["player_id", "season", "team_abbr", "games_played", "time_on_ice", "strength_state", "season_type"]],
-            agg_coach[["coach_name", "season", "team_abbr", "games_played", "time_on_ice", "strength_state", "season_type"]]
+            agg_coach[["coach_name", "season", "team_abbr", "games_played", "time_on_ice", "strength_state", "season_type"] + [f"{state}_time_on_ice" for state in score_states]]
         )
 
 
@@ -1506,8 +1537,12 @@ def wsba_rapm(
         defense_col_name = f'rapm_{defense_target_name}' if shot else f'rapm_{target}_against_per_sixty'
         offense_map_col_name = f'rapm_{target}_for_per_sixty_map'
         defense_map_col_name = f'rapm_{target}_against_per_sixty_map'
+        score_states = ['lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
+        score_pattern = '|'.join(score_states)
         pattern_off_coa = r'^offense_coach_([A-ZÀ-ÖØ-Ý.\'\- ]+)_(\d{8})_([A-Z]{2,3})$'
         pattern_def_coa = r'^defense_coach_([A-ZÀ-ÖØ-Ý.\'\- ]+)_(\d{8})_([A-Z]{2,3})$'
+        pattern_off_coa_score = rf'^offense_coach_({score_pattern})_([A-ZÀ-ÖØ-İ.\'\- ]+)_(\d{{8}})_([A-Z]{{2,3}})$'
+        pattern_def_coa_score = rf'^defense_coach_({score_pattern})_([A-ZÀ-ÖØ-İ.\'\- ]+)_(\d{{8}})_([A-Z]{{2,3}})$'
         
         #Skaters
         offense_RAPM = coefs.loc[
@@ -1553,11 +1588,11 @@ def wsba_rapm(
 
         offense_coach_RAPM['season'] = offense_coach_RAPM['season'].astype('Int64')
         offense_coach_rename = {
-            target: offense_col_name,
+            target: f'rapm_systems_{target}_for_per_sixty',
             'player_id': 'coach_name'
         }
         if use_shift_map and not shot and f'{target}_map' in offense_coach_RAPM.columns:
-            offense_coach_rename[f'{target}_map'] = offense_map_col_name
+            offense_coach_rename[f'{target}_map'] = f'rapm_systems_{target}_for_per_sixty_map'
         offense_coach_RAPM = offense_coach_RAPM.rename(columns=offense_coach_rename)
 
         defense_coach_RAPM = coefs.loc[
@@ -1570,16 +1605,55 @@ def wsba_rapm(
 
         defense_coach_RAPM['season'] = defense_coach_RAPM['season'].astype('Int64')
         defense_coach_rename = {
-            target: defense_col_name,
+            target: f'rapm_systems_{target}_against_per_sixty',
             'player_id': 'coach_name'
         }
         if use_shift_map and not shot and f'{target}_map' in defense_coach_RAPM.columns:
-            defense_coach_rename[f'{target}_map'] = defense_map_col_name
+            defense_coach_rename[f'{target}_map'] = f'rapm_systems_{target}_against_per_sixty_map'
         defense_coach_RAPM = defense_coach_RAPM.rename(columns=defense_coach_rename)
-        if use_shift_map and not shot and defense_map_col_name in defense_coach_RAPM.columns:
-            defense_coach_RAPM[defense_map_col_name] = defense_coach_RAPM[defense_map_col_name].map(
+        if use_shift_map and not shot and f'rapm_systems_{target}_against_per_sixty_map' in defense_coach_RAPM.columns:
+            defense_coach_RAPM[f'rapm_systems_{target}_against_per_sixty_map'] = defense_coach_RAPM[f'rapm_systems_{target}_against_per_sixty_map'].map(
                 lambda encoded: transform_rapm_map(encoded, reverse_x=True) if pd.notna(encoded) else encoded
             )
+
+        offense_score_coach = coefs.loc[
+            coefs['player_id'].str.contains(pattern_off_coa_score, regex=True, na=False)
+        ].copy()
+        if not offense_score_coach.empty:
+            offense_score_coach[['score_state', 'coach_name', 'season', 'team_abbr']] = offense_score_coach['player_id'].str.extract(pattern_off_coa_score)
+            offense_score_coach['season'] = offense_score_coach['season'].astype('Int64')
+            offense_score_dfs = []
+            for state in score_states:
+                temp = offense_score_coach.loc[offense_score_coach['score_state'] == state].copy()
+                if temp.empty:
+                    continue
+                rename = {target: f'rapm_{state}_{target}_for_per_sixty'}
+                if use_shift_map and not shot and f'{target}_map' in temp.columns:
+                    rename[f'{target}_map'] = f'rapm_{state}_{target}_for_per_sixty_map'
+                offense_score_dfs.append(temp.rename(columns=rename)[['coach_name', 'season', 'team_abbr'] + list(rename.values())])
+            if offense_score_dfs:
+                offense_coach_RAPM = reduce(lambda left, right: pd.merge(left, right, how='outer', on=['coach_name', 'season', 'team_abbr']), [offense_coach_RAPM] + offense_score_dfs)
+
+        defense_score_coach = coefs.loc[
+            coefs['player_id'].str.contains(pattern_def_coa_score, regex=True, na=False)
+        ].copy()
+        if not defense_score_coach.empty:
+            defense_score_coach[['score_state', 'coach_name', 'season', 'team_abbr']] = defense_score_coach['player_id'].str.extract(pattern_def_coa_score)
+            defense_score_coach['season'] = defense_score_coach['season'].astype('Int64')
+            defense_score_dfs = []
+            for state in score_states:
+                temp = defense_score_coach.loc[defense_score_coach['score_state'] == state].copy()
+                if temp.empty:
+                    continue
+                rename = {target: f'rapm_{state}_{target}_against_per_sixty'}
+                if use_shift_map and not shot and f'{target}_map' in temp.columns:
+                    temp[f'{target}_map'] = temp[f'{target}_map'].map(
+                        lambda encoded: transform_rapm_map(encoded, reverse_x=True) if pd.notna(encoded) else encoded
+                    )
+                    rename[f'{target}_map'] = f'rapm_{state}_{target}_against_per_sixty_map'
+                defense_score_dfs.append(temp.rename(columns=rename)[['coach_name', 'season', 'team_abbr'] + list(rename.values())])
+            if defense_score_dfs:
+                defense_coach_RAPM = reduce(lambda left, right: pd.merge(left, right, how='outer', on=['coach_name', 'season', 'team_abbr']), [defense_coach_RAPM] + defense_score_dfs)
 
         if shot:
             third_RAPM = coefs.loc[
@@ -1652,7 +1726,24 @@ def wsba_rapm(
 
             goalie_dfs.append(goalie_df)
         else:
-            coach_dfs.append(pd.merge(second_df, coach_df))
+            coach_df = pd.merge(second_df, coach_df)
+            for side in ['for', 'against']:
+                systems_col = f'rapm_systems_{target}_{side}_per_sixty'
+                total_col = f'rapm_{target}_{side}_per_sixty'
+                if systems_col in coach_df.columns:
+                    toi = coach_df['time_on_ice'].fillna(0)
+                    total = coach_df[systems_col].fillna(0).mul(toi).div(60)
+                    for state in score_states:
+                        state_col = f'rapm_{state}_{target}_{side}_per_sixty'
+                        state_toi_col = f'{state}_time_on_ice'
+                        if state_col in coach_df.columns and state_toi_col in coach_df.columns:
+                            total = total.add(coach_df[state_col].fillna(0).mul(coach_df[state_toi_col].fillna(0)).div(60))
+                    coach_df[total_col] = np.where(toi > 0, total.div(toi).mul(60), np.nan)
+                systems_map_col = f'rapm_systems_{target}_{side}_per_sixty_map'
+                total_map_col = f'rapm_{target}_{side}_per_sixty_map'
+                if systems_map_col in coach_df.columns:
+                    coach_df[total_map_col] = coach_df[systems_map_col]
+            coach_dfs.append(coach_df)
 
         rapm_df = pd.merge(toi_df, rapm_df, how='left')
         rapm_dfs.append(rapm_df)

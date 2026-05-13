@@ -1,6 +1,9 @@
 import os
 import sys
+import json
 from pathlib import Path
+import scipy.sparse as sp
+import xgboost as xgb
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -18,6 +21,10 @@ from wsba_ml.gar import wsba_gar
 from wsba_ml.nhl_data import publish_data, skater_dataset as _skater_dataset, team_dataset as _team_dataset
 from wsba_ml.qoc_qot import qoc_qot
 from wsba_ml.rapm import wsba_rapm
+from wsba_ml.xg_model import wsba_xG
+from wsba_ml.xg_model import prep_xG_data
+from wsba_ml.xg_model import apply_time_on_ice
+from wsba_hockey.tools.scraping import adjust_coords
 from wsba_hockey.tools.globals import (
     DATASET_COL,
     SEASON_NAMES,
@@ -93,7 +100,19 @@ def parquet_buffer(df, export_name):
             data[col] = data[col].where(data[col].isna(), data[col].astype(str))
         data.to_parquet(export_name, index=False)
 
-def pbp(seasons='now', start=None, end=None, local=False, append=False):
+def _normalize_id_columns(df):
+    data = df.copy()
+    id_cols = [col for col in data.columns if col == 'game_id' or col.endswith('_id') or col == 'player_id']
+
+    for col in id_cols:
+        data[col] = pd.to_numeric(data[col].replace(r'^\s*$', np.nan, regex=True), errors='coerce')
+
+    if 'game_id' in data.columns:
+        data['game_id'] = data['game_id'].astype('Int64')
+
+    return data
+
+def scrape_pbp(seasons='now', start=None, end=None, local=False, append=False):
     errors=[]
     if seasons == 'now':
         seasons = [seasons]
@@ -105,13 +124,14 @@ def pbp(seasons='now', start=None, end=None, local=False, append=False):
                 games = scores['game_id'].drop_duplicates().to_list()
                 current = scores['season'].iloc[0]
                 
-                data, roster = wsba.nhl_scrape_game(games,remove=[],sources=True,errors=True,xg=True,export_roster=True)
+                data, roster = wsba.nhl_scrape_game(games,remove=[],sources=True,errors=True,xg=False,export_roster=True)
             else:
-                data, roster = wsba.nhl_scrape_season(season,start=start,end=end,local=local,remove=[],xg=True,sources=True,errors=True,export_roster=True)
+                data, roster = wsba.nhl_scrape_season(season,start=start,end=end,local=local,remove=[],xg=False,sources=True,errors=True,export_roster=True)
                 current = season
 
             errors.extend(data['errors'])
-            scraped = data['pbp']
+            scraped = apply_xg(data['pbp'])
+            scraped = _normalize_id_columns(scraped)
 
             scraped["game_id"] = scraped["game_id"].astype('int64')
             games = scraped['game_id'].drop_duplicates().to_list()
@@ -119,6 +139,8 @@ def pbp(seasons='now', start=None, end=None, local=False, append=False):
             if append:
                 dataset = pd.read_parquet(f'{DATA_ROOT}/pbp/nhl_pbp_{current}.parquet')
                 rosterset = pd.read_parquet(f'{DATA_ROOT}/games/rosters/nhl_rosters_{current}.parquet')
+                dataset = _normalize_id_columns(dataset)
+                rosterset = _normalize_id_columns(rosterset)
 
                 dataset['game_id'] = dataset['game_id'].astype('int64')
                 rosterset['game_id'] = rosterset['game_id'].astype('int64')
@@ -132,16 +154,20 @@ def pbp(seasons='now', start=None, end=None, local=False, append=False):
                 rosterset = pd.DataFrame()
 
             combined = pd.concat([dataset,scraped]).sort_values(by=['season','game_id','period','seconds_elapsed','event_num'])
+            combined = _normalize_id_columns(combined)
             parquet_buffer(combined, f'{DATA_ROOT}/pbp/nhl_pbp_{current}.parquet')
 
             combined = pd.concat([rosterset,roster]).sort_values(by=['game_id'])
+            combined = _normalize_id_columns(combined)
             parquet_buffer(combined, f'{DATA_ROOT}/games/rosters/nhl_rosters_{current}.parquet')
 
             for group in ['skater','team','goalie']:
                 scraped_games = gen_stats(scraped, group)
+                scraped_games = _normalize_id_columns(scraped_games)
 
                 if append:
                     games_df = pd.read_parquet(f'{DATA_ROOT}/games/{group}_games/wsba_nhl_{current}_{group}_games.parquet')
+                    games_df = _normalize_id_columns(games_df)
 
                     games_df['game_id'] = games_df['game_id'].astype('int64')
 
@@ -151,6 +177,7 @@ def pbp(seasons='now', start=None, end=None, local=False, append=False):
                     games_df = pd.DataFrame()
 
                 combined_games = pd.concat([games_df,scraped_games])
+                combined_games = _normalize_id_columns(combined_games)
                 parquet_buffer(combined_games, f'{DATA_ROOT}/games/{group}_games/wsba_nhl_{current}_{group}_games.parquet')
             
         except Exception as e:
@@ -302,6 +329,92 @@ def assess_a3z(seasons):
         non_shots = (df['event_type']=='entry-sequence').sum()
 
         print(f'{season}\nxG Shots: {xg_shots}\nShots: {shots}\nShot Coverage: {((xg_shots/shots)*100).round(2)}%\nNon-Shots: {non_shots}\n')
+
+def build_xg(seasons, models=['ev', 'pp', 'pk', 'en']):
+    if isinstance(seasons, int):
+        seasons = [seasons]
+
+    pbp = load_pbp(seasons)
+    os.makedirs(f'{WSBA_ML_ROOT}/xg_model/testing', exist_ok=True)
+    os.makedirs(f'{WSBA_ML_ROOT}/xg_model', exist_ok=True)
+    model_ref = {
+        'ev': (wsba.STRENGTH_GROUPS['even_strength'], False),
+        'pp': (wsba.STRENGTH_GROUPS['power_play']+['6v5', '6v4'], False),
+        'pk': (wsba.STRENGTH_GROUPS['penalty_kill'], False),
+        'en': (wsba.STRENGTHS, True),
+    }
+
+    for model in models:
+        strengths, empty_net = model_ref[model]
+        
+        wsba_xG(
+            pbp,
+            train=True,
+            hypertune=True,
+            strengths=strengths,
+            empty_net=empty_net,
+            train_runs=20,
+            cv_runs=10,
+            test_path=f'{WSBA_ML_ROOT}/xg_model/testing/xg_model_training_runs_{model}.csv',
+            cv_path=f'{WSBA_ML_ROOT}/xg_model/testing/xg_model_cv_runs_{model}.csv',
+            model_path=f'{WSBA_ML_ROOT}/xg_model/wsba_xg_{model}.json',
+        )
+
+def apply_xg(pbp):
+    data = pbp.copy()
+    data['xG'] = 0.0
+
+    data['event_index'] = data.index
+    data = adjust_coords(data)
+    data['strength_state'] = np.where(
+        (data['season_type'] == 3) & (data['period'] > 4),
+        np.where(
+            data['event_team_abbr'] == data['away_team_abbr'],
+            data['away_skaters'].astype(str) + "v" + data['home_skaters'].astype(str),
+            data['home_skaters'].astype(str) + "v" + data['away_skaters'].astype(str)
+        ),
+        data['strength_state']
+    )
+
+    xg_data = prep_xG_data(
+        data.loc[
+            data['event_type'].isin(wsba.EVENTS) &
+            data['strength_state'].isin(wsba.STRENGTHS) &
+            data['x'].notna() &
+            data['y'].notna()
+        ].copy()
+    )
+    xg_data = xg_data.loc[xg_data['event_type'].isin(wsba.FENWICK_EVENTS)].copy()
+    if xg_data.empty:
+        return data.sort_values(by=['game_id', 'period', 'seconds_elapsed', 'event_num'])
+
+    empty_mask = xg_data['event_goalie_id'].isna()
+    models = {
+        'ev': (~empty_mask & xg_data['strength_state'].isin(wsba.STRENGTH_GROUPS['even_strength']), 'wsba_xg_ev.json'),
+        'pp': (~empty_mask & xg_data['strength_state'].isin(wsba.STRENGTH_GROUPS['power_play'] + ['6v5', '6v4']), 'wsba_xg_pp.json'),
+        'pk': (~empty_mask & xg_data['strength_state'].isin(wsba.STRENGTH_GROUPS['penalty_kill']), 'wsba_xg_pk.json'),
+        'en': (empty_mask, 'wsba_xg_en.json'),
+    }
+
+    for mask, model_file in models.values():
+        if not mask.any():
+            continue
+        model_data = xg_data.loc[mask].copy()
+        model = xgb.Booster()
+        model.load_model(f'{WSBA_ML_ROOT}/xg_model/{model_file}')
+        feature_path = f'{WSBA_ML_ROOT}/xg_model/{model_file.replace(".json", "_features.json")}'
+        if os.path.exists(feature_path):
+            with open(feature_path, 'r') as f:
+                features = json.load(f)
+        else:
+            features = model.feature_names or (wsba.CONTINUOUS + wsba.BOOLEAN)
+        matrix = xgb.DMatrix(
+            data=sp.csr_matrix(model_data[features]),
+            feature_names=features
+        )
+        data.loc[model_data.index, 'xG'] = model.predict(matrix)
+
+    return data
 
 def build_game_score(seasons):
     for season in seasons:

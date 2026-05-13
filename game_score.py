@@ -33,7 +33,28 @@ GS_VARIABLES = [
     'faceoff_losses'
 ]
 
+GAME_SCORE_SCHEMA_ALIASES = {
+    'hits_for': 'hits_applied',
+    'hits_against': 'hits_received',
+    'penalties': 'penalties_taken',
+}
+
+def normalize_game_score_schema(stats):
+    stats = stats.copy()
+
+    for target, source in GAME_SCORE_SCHEMA_ALIASES.items():
+        if target not in stats.columns and source in stats.columns:
+            stats[target] = stats[source]
+
+    for col in BIO + [GS_TARGET] + GS_VARIABLES:
+        if col not in stats.columns and col != GS_TARGET:
+            stats[col] = 0
+
+    return stats
+
 def prepare_game_score(stats):
+    stats = normalize_game_score_schema(stats)
+
     #Condense strengths to EV/PP/PK
     stats['strength_state'] = stats['strength_state'].map(
         wsba.STRENGTH_MAP
