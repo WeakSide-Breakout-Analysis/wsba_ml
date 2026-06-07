@@ -1,6 +1,6 @@
 ## WSBA ML
 
-[WeakSide Breakout Analysis Web Application](weaksidebreakout.com)
+[WeakSide Breakout Analysis Web Application](https://weaksidebreakout.com)
 
 Collection of modelling efforts utilized in the production of analytics-based hockey content shared online.  Cloning and running the repository, given that the input play-by-play data is obtained through the wsba_hockey Python package, should mostly reproduce this content.  Some files are ommitted due to Git's file size limits or reference proprietary data.
 
