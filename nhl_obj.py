@@ -1,5 +1,6 @@
 import random
 import string
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import wsba_hockey as wsba
@@ -10,6 +11,42 @@ import wsba_hockey as wsba
 SEASONS = wsba.SEASON_NAMES.keys()
 ROSTERS = wsba.repo_load_rosters(SEASONS)
 PLAYER_LOOKUP = ROSTERS.drop_duplicates('player_id').set_index('player_id').to_dict('index')
+SIMULATION_NAMES_PATH = Path(__file__).resolve().parent / "simulation" / "sim_data" / "names.csv"
+
+
+def _load_placeholder_name_pool():
+    try:
+        frame = pd.read_csv(SIMULATION_NAMES_PATH)
+    except Exception:
+        return []
+
+    if "first_name" not in frame.columns or "last_name" not in frame.columns:
+        return []
+
+    out = []
+    for first_name, last_name in zip(frame["first_name"], frame["last_name"]):
+        first = str(first_name or "").strip()
+        last = str(last_name or "").strip()
+        if first and first.lower() != "nan" and last and last.lower() != "nan":
+            out.append((first.upper(), last.upper()))
+    return out
+
+
+PLACEHOLDER_NAME_POOL = _load_placeholder_name_pool()
+COACH_SCORE_STATES = ['tied', 'lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
+COACH_SCORE_METRICS = ['corsi', 'fenwick', 'expected_goals', 'goals']
+COACH_SCORE_SIDES = ['for', 'against']
+COACH_SCORE_STRENGTH_PREFIXES = {
+    'even_strength': 'ev',
+    'power_play': 'pp',
+    'penalty_kill': 'pk',
+}
+COACH_SCORE_COLUMNS = [
+    f'rapm_{state}_{metric}_{side}_per_sixty'
+    for state in COACH_SCORE_STATES
+    for metric in COACH_SCORE_METRICS
+    for side in COACH_SCORE_SIDES
+]
 
 # Helper function to quickly generate a lineup template
 def build_lineup_template(
@@ -269,6 +306,18 @@ class NHLCoach:
 
         self.taken_pens = self._select_data(coach_data, 'rapm_penalty_minutes_for_per_sixty')
         self.drawn_pens = self._select_data(coach_data, 'rapm_penalty_minutes_against_per_sixty')
+        for column in COACH_SCORE_COLUMNS:
+            setattr(self, column, self._select_data(coach_data, column))
+        for strength_state, prefix in COACH_SCORE_STRENGTH_PREFIXES.items():
+            strength_data = coach_data
+            if 'strength_state' in strength_data.columns:
+                strength_data = strength_data.loc[strength_data['strength_state'].astype(str).eq(strength_state)]
+            for column in COACH_SCORE_COLUMNS:
+                alias = f'{prefix}_{column}'
+                value = self._select_data(strength_data, column, None)
+                if value is None:
+                    value = self._select_data(coach_data, alias)
+                setattr(self, alias, value)
 
 class NHLTeam:
     def __init__(self, abbr, player_ids=None, data=None, name=None, lineup=None, coach_name=None):
@@ -278,6 +327,7 @@ class NHLTeam:
 
         if player_ids and data is not None:
             self.roster = [NHLPlayer(p, data) for p in player_ids]
+            self._populate_placeholder_identity()
             self._fill_missing()
             self._build_index()
 
@@ -296,9 +346,37 @@ class NHLTeam:
     # Fill in as many necessary roster spots with fake players as possible
     # These are (assumed) league-average players
     def _fake_name(self):
+        if PLACEHOLDER_NAME_POOL:
+            first, last = random.choice(PLACEHOLDER_NAME_POOL)
+            return f"{first} {last}"
         first = ''.join(random.choices(string.ascii_uppercase, k=6))
         last = ''.join(random.choices(string.ascii_uppercase, k=8))
         return f"{first} {last}"
+
+    def _is_placeholder_player(self, player):
+        player_id = int(getattr(player, "player_id", 0) or 0)
+        player_name = str(getattr(player, "player_name", "") or "").strip().upper()
+        return (
+            player_id < 0
+            or player_name in {"", "PLAYER", "NOT FOUND", "NAN"}
+            or (6000000 <= player_id < 8000000 and player_name in {"", "PLAYER", "NOT FOUND", "NAN"})
+        )
+
+    def _populate_placeholder_identity(self):
+        existing_names = {
+            str(getattr(player, "player_name", "") or "").strip().upper()
+            for player in getattr(self, "roster", [])
+            if str(getattr(player, "player_name", "") or "").strip()
+        }
+
+        for player in getattr(self, "roster", []):
+            if not self._is_placeholder_player(player):
+                continue
+            fake_name = self._fake_name()
+            while fake_name.upper() in existing_names:
+                fake_name = self._fake_name()
+            player.player_name = fake_name
+            existing_names.add(fake_name.upper())
 
     def _fill_missing(self):
         target = {"F": 13, "D": 7, "G": 3}
@@ -455,7 +533,7 @@ class NHLTeam:
         if self.coach is None:
             return pd.DataFrame()
 
-        return pd.DataFrame([{
+        row = {
             'player_id': None,
             'player_name': None,
             'coach_name': getattr(self.coach, 'coach_name', None),
@@ -483,7 +561,11 @@ class NHLTeam:
             'ev_fenwick_defense_map': getattr(self.coach, 'ev_fenwick_defense_map', None),
             'pp_fenwick_offense_map': getattr(self.coach, 'pp_fenwick_offense_map', None),
             'pk_fenwick_defense_map': getattr(self.coach, 'pk_fenwick_defense_map', None)
-        }])
+        }
+        row.update({column: getattr(self.coach, column, None) for column in COACH_SCORE_COLUMNS})
+        for prefix in COACH_SCORE_STRENGTH_PREFIXES.values():
+            row.update({f'{prefix}_{column}': getattr(self.coach, f'{prefix}_{column}', None) for column in COACH_SCORE_COLUMNS})
+        return pd.DataFrame([row])
 
     # Export player data in the team to a dataframe for reference and restoration
 

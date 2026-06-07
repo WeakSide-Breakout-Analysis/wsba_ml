@@ -20,6 +20,13 @@ COMPONENTS = [
     'drawn_penalties'
 ]
 
+FENWICK_COMPONENTS = [
+    'even_strength_generation_fenwick',
+    'even_strength_suppression_fenwick',
+    'power_play_generation_fenwick',
+    'penalty_kill_suppression_fenwick'
+]
+
 RATINGS = {
     'generation': [
         'even_strength_generation',
@@ -69,6 +76,71 @@ RATINGS = {
     ]
 }
 
+COACH_SCORE_STATES = [
+    'tied',
+    'lead_1',
+    'lead_2',
+    'lead_3_plus',
+    'behind_1',
+    'behind_2',
+    'behind_3_plus',
+]
+
+COACH_SYSTEM_COMPONENTS = [
+    'even_strength_generation',
+    'even_strength_suppression'
+]
+
+COACH_SCORE_COMPONENTS = [
+    f'{state}_even_strength_generation' for state in COACH_SCORE_STATES
+] + [
+    f'{state}_even_strength_suppression' for state in COACH_SCORE_STATES
+]
+
+COACH_RATINGS = {
+    'systems': COACH_SYSTEM_COMPONENTS,
+    'score_states': COACH_SCORE_COMPONENTS,
+    'penalties': [
+        'taken_penalties',
+        'drawn_penalties'
+    ],
+    'generation': [
+        'even_strength_generation',
+        *[f'{state}_even_strength_generation' for state in COACH_SCORE_STATES]
+    ],
+    'suppression': [
+        'even_strength_suppression',
+        *[f'{state}_even_strength_suppression' for state in COACH_SCORE_STATES]
+    ],
+    'expected_goals_above_replacement': [
+        'even_strength_generation',
+        'even_strength_suppression',
+        *COACH_SCORE_COMPONENTS,
+        'power_play_generation',
+        'penalty_kill_suppression',
+        'taken_penalties',
+        'drawn_penalties'
+    ],
+    'goals_above_replacement': [
+        'even_strength_generation',
+        'even_strength_suppression',
+        *COACH_SCORE_COMPONENTS,
+        'power_play_generation',
+        'penalty_kill_suppression',
+        'taken_penalties',
+        'drawn_penalties'
+    ]
+}
+
+PRIOR_IMPACT_METRICS = [
+    'shooting',
+    'passing',
+    'entries',
+    'exits',
+    'forechecking',
+    'prevention',
+]
+
 REPLACEMENT_THRESHOLD = {
     'even_strength': {'F': 13, 'D': 7},
     'power_play': {'F': 9, 'D': 4},
@@ -115,6 +187,18 @@ def calc_replacement(df, col):
     # apply replacement adjustment
     return df[col] + (df_rep['replacement_avg'] / 60 * df[toi_col])
 
+def _sum_existing(df, cols):
+    existing = [col for col in cols if col in df.columns]
+    if not existing:
+        return pd.Series(0.0, index=df.index)
+    return df[existing].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+
+def _first_existing(df, cols):
+    for col in cols:
+        if col in df.columns:
+            return col
+    return None
+
 def wsba_gar(group='skater', shifts = pd.DataFrame(), shots = pd.DataFrame(), pens = pd.DataFrame()):
     #Main function for the WSBA Goals Above Replacement Model
     if group == 'skater':
@@ -142,11 +226,36 @@ def wsba_gar(group='skater', shifts = pd.DataFrame(), shots = pd.DataFrame(), pe
             df[f'{strength}_generation'] = df['rapm_expected_goals_for_per_sixty']
             df[f'{strength}_suppression'] = -df['rapm_expected_goals_against_per_sixty']
 
-            dfs.append(df[[
+            select_cols = [
                 'player_id', 'season', 'team_abbr',
                 f'{strength}_time_on_ice', f'{strength}_time_on_ice_per_games_played',
                 f'{strength}_generation', f'{strength}_suppression'
-            ]].dropna(how='all', axis=1))
+            ]
+
+            if strength in ['even_strength', 'power_play'] and 'rapm_fenwick_for_per_sixty' in df.columns:
+                df[f'{strength}_generation_fenwick'] = df['rapm_fenwick_for_per_sixty']
+                select_cols.append(f'{strength}_generation_fenwick')
+
+            if strength in ['even_strength', 'penalty_kill'] and 'rapm_fenwick_against_per_sixty' in df.columns:
+                df[f'{strength}_suppression_fenwick'] = -df['rapm_fenwick_against_per_sixty']
+                select_cols.append(f'{strength}_suppression_fenwick')
+
+            if strength == 'even_strength':
+                for metric in PRIOR_IMPACT_METRICS:
+                    gen_src = f'rapm_expected_goals_for_per_sixty_prior_{metric}_impact'
+                    sup_src = f'rapm_expected_goals_against_per_sixty_prior_{metric}_impact'
+                    gen_col = f'{metric}_generation'
+                    sup_col = f'{metric}_suppression'
+
+                    if gen_src in df.columns:
+                        df[gen_col] = df[gen_src]
+                        select_cols.append(gen_col)
+
+                    if sup_src in df.columns:
+                        df[sup_col] = -df[sup_src]
+                        select_cols.append(sup_col)
+
+            dfs.append(df[select_cols].dropna(how='all', axis=1))
 
         rapms = reduce(lambda left, right: pd.merge(left, right, how='left'), dfs)
         result = pd.merge(result, rapms, how='right')
@@ -163,7 +272,10 @@ def wsba_gar(group='skater', shifts = pd.DataFrame(), shots = pd.DataFrame(), pe
 
         result = pd.merge(result, all_dfs[['player_id', 'season', 'team_abbr', 'time_on_ice', 'time_on_ice_per_games_played', 'finishing', 'induction', 'taken_penalties', 'drawn_penalties']], how='left')
         
-        for col in COMPONENTS:
+        for col in COMPONENTS + FENWICK_COMPONENTS:
+            if col not in result.columns:
+                continue
+
             if 'even_strength' in col:
                 prefix = 'even_strength_'
             elif 'power_play' in col:
@@ -175,6 +287,12 @@ def wsba_gar(group='skater', shifts = pd.DataFrame(), shots = pd.DataFrame(), pe
 
             result[col] = (result[col]/60) * result[f'{prefix}time_on_ice']
             #result[col] = calc_replacement(result, col)
+
+        for metric in PRIOR_IMPACT_METRICS:
+            for side in ['generation', 'suppression']:
+                col = f'{metric}_{side}'
+                if col in result.columns:
+                    result[col] = (result[col] / 60) * result['even_strength_time_on_ice']
 
         for comp, cols in RATINGS.items():
             result[comp] = result[cols].sum(axis=1)
@@ -220,44 +338,75 @@ def wsba_gar(group='skater', shifts = pd.DataFrame(), shots = pd.DataFrame(), pe
             df = shifts.query(
                 "strength_state == @strength "
                 f"and time_on_ice >= {150 if strength == 'even_strength' else 50}"
-            )
+            ).copy()
+
+            if df.empty:
+                continue
 
             df[f'{strength}_time_on_ice'] = df['time_on_ice']
             df[f'{strength}_time_on_ice_per_games_played'] = df['time_on_ice'] / df['games_played']
 
-            df[f'{strength}_generation'] = df['rapm_expected_goals_for_per_sixty']
-            df[f'{strength}_suppression'] = -df['rapm_expected_goals_against_per_sixty']
-
-            dfs.append(df[[
+            select_cols = [
                 'coach_name', 'season', 'team_abbr',
-                f'{strength}_time_on_ice', f'{strength}_time_on_ice_per_games_played',
-                f'{strength}_generation', f'{strength}_suppression'
-            ]].dropna(how='all', axis=1))
+                f'{strength}_time_on_ice',
+                f'{strength}_time_on_ice_per_games_played',
+            ]
+
+            df[f'{strength}_generation'] = pd.to_numeric(df['rapm_systems_expected_goals_for_per_sixty'], errors='coerce') * df['time_on_ice'] / 60
+            df[f'{strength}_suppression'] = -pd.to_numeric(df['rapm_systems_expected_goals_against_per_sixty'], errors='coerce') * df['time_on_ice'] / 60
+            select_cols.extend([f'{strength}_generation', f'{strength}_suppression'])
+
+            if strength in ['even_strength', 'power_play'] and 'rapm_systems_fenwick_for_per_sixty' in df.columns:
+                df[f'{strength}_generation_fenwick'] = pd.to_numeric(df['rapm_systems_fenwick_for_per_sixty'], errors='coerce') * df['time_on_ice'] / 60
+                select_cols.append(f'{strength}_generation_fenwick')
+
+            if strength in ['even_strength', 'penalty_kill'] and 'rapm_systems_fenwick_against_per_sixty' in df.columns:
+                df[f'{strength}_suppression_fenwick'] = -pd.to_numeric(df['rapm_systems_fenwick_against_per_sixty'], errors='coerce') * df['time_on_ice'] / 60
+                select_cols.append(f'{strength}_suppression_fenwick')
+
+            if strength == 'even_strength':
+                for state in COACH_SCORE_STATES:
+                    state_toi_col = f'{state}_time_on_ice'
+                    state_gen_src = f'rapm_{state}_expected_goals_for_per_sixty'
+                    state_sup_src = f'rapm_{state}_expected_goals_against_per_sixty'
+                    state_gen_col = f'{state}_even_strength_generation'
+                    state_sup_col = f'{state}_even_strength_suppression'
+
+                    if state_toi_col in df.columns and state_gen_src in df.columns:
+                        df[state_gen_col] = (
+                            pd.to_numeric(df[state_gen_src], errors='coerce')
+                            * pd.to_numeric(df[state_toi_col], errors='coerce')
+                            / 60
+                        )
+                        select_cols.append(state_gen_col)
+
+                    if state_toi_col in df.columns and state_sup_src in df.columns:
+                        df[state_sup_col] = (
+                            -pd.to_numeric(df[state_sup_src], errors='coerce')
+                            * pd.to_numeric(df[state_toi_col], errors='coerce')
+                            / 60
+                        )
+                        select_cols.append(state_sup_col)
+
+            dfs.append(df[select_cols].dropna(how='all', axis=1))
 
         rapms = reduce(lambda left, right: pd.merge(left, right, how='left'), dfs)
         result = pd.merge(result, rapms, how='right')
-                            
-        pens['taken_penalties'] = -pens['rapm_penalty_minutes_for_per_sixty'] * 0.02
-        pens['drawn_penalties'] = pens['rapm_penalty_minutes_against_per_sixty'] * 0.02
+
+        pens['taken_penalties'] = -pens['rapm_penalty_minutes_for_per_sixty'] * 0.02 * pens['time_on_ice'] / 60
+        pens['drawn_penalties'] = pens['rapm_penalty_minutes_against_per_sixty'] * 0.02 * pens['time_on_ice'] / 60
 
         result = pd.merge(result, pens[['coach_name', 'season', 'team_abbr', 'time_on_ice', 'taken_penalties', 'drawn_penalties']], how='left')
 
-        components = [col for col in COMPONENTS if col not in ['finishing', 'induction']]
-        for col in components:
-            if 'even_strength' in col:
-                prefix = 'even_strength_'
-            elif 'power_play' in col:
-                prefix = 'power_play_'
-            elif 'penalty_kill' in col:
-                prefix = 'penalty_kill_'
-            else:
-                prefix = ''
+        coach_component_cols = sorted({
+            col for cols in COACH_RATINGS.values() for col in cols
+        })
+        for col in coach_component_cols:
+            if col not in result.columns:
+                result[col] = 0.0
 
-            result[col] = (result[col]/60) * result[f'{prefix}time_on_ice']
-
-        for comp, cols in RATINGS.items():
-            filtered_cols = [col for col in cols if col not in ['finishing', 'induction']]
-            result[comp] = result[filtered_cols].sum(axis=1)
+        for comp, cols in COACH_RATINGS.items():
+            result[comp] = result[cols].sum(axis=1)
 
         return result
     else:

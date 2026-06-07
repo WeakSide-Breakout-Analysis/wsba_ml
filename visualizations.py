@@ -16,7 +16,7 @@ from scipy.ndimage import gaussian_filter
 
 import wsba_hockey as wsba
 from wsba_hockey.tools.plotting import wsba_rink
-from wsba_ml.rapm import MAP_Y, rapm_four_maps
+from wsba_ml.rapm import MAP_Y, weighted_map, rapm_four_maps
 
 
 def _find_workspace_root() -> Path:
@@ -48,7 +48,7 @@ def _workspace_or_country_info_path(workspace_path: Path) -> Path:
 
 
 WORKSPACE_ROOT = _find_workspace_root()
-DATA_ROOT = Path(os.environ.get("WSBA_DATA_ROOT", WORKSPACE_ROOT / "data")).expanduser().resolve()
+DATA_ROOT = Path(os.environ.get("WSBA_DATA_ROOT") or (WORKSPACE_ROOT / "data")).expanduser().resolve()
 WSBA_HOCKEY_PACKAGE_ROOT = WORKSPACE_ROOT / "wsba_hockey" / "src" / "wsba_hockey"
 
 HS_DATA_PATH = DATA_ROOT / "datasets" / "nhl_hs_dataset.csv"
@@ -72,7 +72,8 @@ SECTION_GAP = 4
 SECTION_LABEL_RATIO = 0.44
 ACCENT_BAR_HEIGHT = 14
 REMOTE_IMAGE_TIMEOUT = 1.0
-RAPM_DATA_DIR = DATA_ROOT / "rapm"
+RAPM_DATA_DIR = DATA_ROOT / "shots_rapm"
+COACH_GAR_DATA_PATH = DATA_ROOT / "gar" / "nhl_gar_dataset_coach.csv"
 RAPM_PLOTTING_METRICS = {
     "expected_goals": "Expected Goals",
     "goals": "Goals",
@@ -152,6 +153,24 @@ MICROIMPACT_LABELS = [
     "Entry Targets",
     "Carries Against",
     "Disrupted Entries",
+]
+
+COACH_IMPACT_LABELS = [
+    "EV Generation",
+    "EV Suppression",
+    "Taken Penalties",
+    "Drawn Penalties",
+    "Goals Above Replacement",
+]
+
+COACH_SCORE_STATE_ROWS = [
+    ("Behind 3+ EV", "behind_3_plus"),
+    ("Behind 2 EV", "behind_2"),
+    ("Behind 1 EV", "behind_1"),
+    ("Tied EV", "tied"),
+    ("Lead 1 EV", "lead_1"),
+    ("Lead 2 EV", "lead_2"),
+    ("Lead 3+ EV", "lead_3_plus"),
 ]
 
 BASE_AGG_COLUMNS = [
@@ -400,6 +419,41 @@ def _resolve_card_layout(card_layout: dict[str, PixelRect] | None) -> dict[str, 
     return merged
 
 
+def _default_coach_card_layout() -> dict[str, PixelRect]:
+    return {
+        "title": PixelRect(20, 18, 554, 58),
+        "header_bar": PixelRect(20, 84, 1200, ACCENT_BAR_HEIGHT),
+        "identity_title": PixelRect(20, 108, 554, 30),
+        "identity_panel": PixelRect(20, 108, 554, 112),
+        "identity_logo": PixelRect(30, 122, 150, 88),
+        "season_label": PixelRect(30, 206, 150, 20),
+        "info_divider": PixelRect(20, 236, 1200, ACCENT_BAR_HEIGHT),
+        "systems_title": PixelRect(210, 100, 286, 30),
+        "systems_panel": PixelRect(210, 132, 286, 100),
+        "offense_score_title": PixelRect(24, 252, 269, 52),
+        "offense_score_panel": PixelRect(24, 314, 269, 314),
+        "defense_score_title": PixelRect(305, 252, 269, 52),
+        "defense_score_panel": PixelRect(305, 314, 269, 314),
+        "locational_title_systems": PixelRect(574, 15, 646, 34),
+        "locational_panel_systems": PixelRect(574, 52, 646, 250),
+        "locational_cbar": PixelRect(574, 310, 646, 32),
+        "locational_title_overall": PixelRect(574, 346, 646, 34),
+        "locational_panel_overall": PixelRect(574, 384, 646, 244),
+        "footer_blue": PixelRect(20, 638, 1190, ACCENT_BAR_HEIGHT),
+        "footer_red": PixelRect(20, 672, 1190, ACCENT_BAR_HEIGHT),
+        "footer_text": PixelRect(20, 689, 1085, 42),
+    }
+
+
+def _resolve_coach_card_layout(card_layout: dict[str, PixelRect] | None) -> dict[str, PixelRect]:
+    base = _default_coach_card_layout()
+    if not card_layout:
+        return base
+    merged = dict(base)
+    merged.update(card_layout)
+    return merged
+
+
 def _render_figure_to_image(fig, *, tight: bool = False) -> Image.Image:
     buffer = BytesIO()
     bbox = "tight" if tight else None
@@ -422,7 +476,7 @@ def _image_from_png_bytes(payload: bytes) -> Image.Image:
 @lru_cache(maxsize=8)
 def _rapm_shifts(seasons_key: tuple[int, ...]) -> pd.DataFrame:
     return pd.concat(
-        [pd.read_csv(RAPM_DATA_DIR / f"nhl_rapm_{season}.csv") for season in seasons_key],
+        [pd.read_parquet(RAPM_DATA_DIR / f"nhl_shots_rapm_{season}.parquet") for season in seasons_key],
         ignore_index=True,
     )
 
@@ -880,6 +934,188 @@ def _card_dataset(seasons: list[int]) -> pd.DataFrame:
     return _card_dataset_cached(_seasons_key(seasons))
 
 
+@lru_cache(maxsize=8)
+def _load_coach_gar_dataset_cached(seasons_key: tuple[int, ...]) -> pd.DataFrame:
+    if not COACH_GAR_DATA_PATH.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(COACH_GAR_DATA_PATH)
+    if "season" in df.columns:
+        df = df.loc[pd.to_numeric(df["season"], errors="coerce").isin(seasons_key)].copy()
+    if "coach_name" in df.columns:
+        df["coach_name"] = df["coach_name"].astype(str).str.strip()
+        df = df.loc[df["coach_name"].ne("") & df["coach_name"].str.lower().ne("nan")]
+    return df.reset_index(drop=True)
+
+
+@lru_cache(maxsize=8)
+def _coach_card_dataset_cached(seasons_key: tuple[int, ...]) -> pd.DataFrame:
+    df = _load_coach_gar_dataset_cached(seasons_key)
+    if df.empty:
+        return pd.DataFrame()
+
+    metric_columns = [
+        "time_on_ice",
+        "even_strength_generation",
+        "even_strength_suppression",
+        "taken_penalties",
+        "drawn_penalties",
+        "goals_above_replacement",
+        *[f"{state}_even_strength_generation" for _label, state in COACH_SCORE_STATE_ROWS],
+        *[f"{state}_even_strength_suppression" for _label, state in COACH_SCORE_STATE_ROWS],
+    ]
+    metric_columns = [column for column in metric_columns if column in df.columns]
+    numeric = df[["coach_name", *metric_columns]].copy()
+    for column in metric_columns:
+        numeric[column] = pd.to_numeric(numeric[column], errors="coerce")
+    summary = numeric.groupby("coach_name", dropna=False, as_index=False)[metric_columns].sum(min_count=1)
+
+    ordered = df.sort_values(["coach_name", "season", "team_abbr"], ascending=[True, True, True]).reset_index(drop=True)
+    last_rows = ordered.drop_duplicates(subset=["coach_name"], keep="last")[["coach_name", "team_abbr"]].rename(
+        columns={"team_abbr": "last_team_abbr"}
+    )
+    season_bounds = (
+        ordered.groupby("coach_name")["season"]
+        .agg(season_min="min", season_max="max")
+        .reset_index()
+    )
+    season_bounds["season_label"] = np.where(
+        season_bounds["season_min"] == season_bounds["season_max"],
+        season_bounds["season_min"].astype(str),
+        season_bounds["season_min"].astype(str).str[:4] + "-" + season_bounds["season_max"].astype(str).str[4:],
+    )
+
+    summary = summary.merge(last_rows, on="coach_name", how="left")
+    summary = summary.merge(season_bounds[["coach_name", "season_label"]], on="coach_name", how="left")
+    summary["team_abbr"] = summary["last_team_abbr"].fillna("")
+    summary["coach_id"] = summary["coach_name"]
+
+    percentile_columns = [
+        "even_strength_generation",
+        "even_strength_suppression",
+        "taken_penalties",
+        "drawn_penalties",
+        "goals_above_replacement",
+        *[f"{state}_even_strength_generation" for _label, state in COACH_SCORE_STATE_ROWS],
+        *[f"{state}_even_strength_suppression" for _label, state in COACH_SCORE_STATE_ROWS],
+    ]
+    for column in percentile_columns:
+        if column not in summary.columns:
+            summary[column] = np.nan
+        percentile_column = f"{column}_percentile"
+        summary[percentile_column] = np.nan
+        eligible = summary[column].notna()
+        if not eligible.any():
+            continue
+        summary.loc[eligible, percentile_column] = (
+            summary.loc[eligible, column]
+            .rank(pct=True, method="max")
+            .mul(100)
+            .round()
+            .clip(0, 100)
+        )
+
+    keep = ["coach_name", "coach_id", "season_label", "team_abbr", "time_on_ice"]
+    keep += percentile_columns
+    keep += [f"{column}_percentile" for column in percentile_columns]
+    keep = [column for column in keep if column in summary.columns]
+    return summary[keep].copy()
+
+
+def _coach_card_dataset(seasons: list[int]) -> pd.DataFrame:
+    return _coach_card_dataset_cached(_seasons_key(seasons))
+
+
+@lru_cache(maxsize=8)
+def _coach_rapm_dataset_cached(seasons_key: tuple[int, ...]) -> pd.DataFrame:
+    frames = []
+    for season in seasons_key:
+        path = RAPM_DATA_DIR / f"nhl_shots_rapm_coach_{season}.parquet"
+        if not path.exists():
+            continue
+        frame = pd.read_parquet(path)
+        if "season_type" in frame.columns:
+            frame = frame.loc[pd.to_numeric(frame["season_type"], errors="coerce").fillna(2).eq(2)].copy()
+        if "strength_state" in frame.columns:
+            frame = frame.loc[frame["strength_state"].astype(str).eq("even_strength")].copy()
+        if "coach_name" in frame.columns:
+            frame["coach_name"] = frame["coach_name"].astype(str).str.strip()
+            frame = frame.loc[frame["coach_name"].ne("") & frame["coach_name"].str.lower().ne("nan")]
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+@lru_cache(maxsize=256)
+def _coach_rapm_panel_images_cached(
+    coach_name: str,
+    seasons_key: tuple[int, ...],
+    plotting_metric: str,
+    systems_size: tuple[int, int],
+    overall_size: tuple[int, int],
+    cbar_size: tuple[int, int],
+) -> tuple[bytes, bytes, bytes]:
+    rapm = _coach_rapm_dataset_cached(seasons_key)
+    coach_rows = rapm.loc[rapm["coach_name"].astype(str).str.upper().eq(str(coach_name).upper())].copy()
+    if coach_rows.empty:
+        raise ValueError(f"Coach RAPM data unavailable for {coach_name}.")
+
+    score_state_for_columns = [f"rapm_{state}_{plotting_metric}_for_per_sixty_map" for _label, state in COACH_SCORE_STATE_ROWS]
+    score_state_against_columns = [f"rapm_{state}_{plotting_metric}_against_per_sixty_map" for _label, state in COACH_SCORE_STATE_ROWS]
+
+    systems_for = gaussian_filter(
+        weighted_map(coach_rows, f"rapm_systems_{plotting_metric}_for_per_sixty_map"),
+        sigma=5,
+    )
+    systems_against = gaussian_filter(
+        weighted_map(coach_rows, f"rapm_systems_{plotting_metric}_against_per_sixty_map"),
+        sigma=5,
+    )
+    overall_for = gaussian_filter(
+        sum(
+            (weighted_map(coach_rows, column) for column in [f"rapm_systems_{plotting_metric}_for_per_sixty_map", *score_state_for_columns]),
+            np.zeros_like(systems_for),
+        ),
+        sigma=5,
+    )
+    overall_against = gaussian_filter(
+        sum(
+            (weighted_map(coach_rows, column) for column in [f"rapm_systems_{plotting_metric}_against_per_sixty_map", *score_state_against_columns]),
+            np.zeros_like(systems_against),
+        ),
+        sigma=5,
+    )
+
+    all_grids = np.stack([systems_for, systems_against, overall_for, overall_against])
+    nonzero_values = np.abs(all_grids[np.abs(all_grids) > 0])
+    if nonzero_values.size:
+        limit = float(np.percentile(nonzero_values, RAPM_HEATMAP_LIMIT_PERCENTILE))
+        limit = max(limit, float(nonzero_values.max()) * 0.35)
+    else:
+        limit = 1.0
+
+    systems_image = _rapm_rink_image(
+        systems_against,
+        systems_for,
+        "EV Suppression",
+        "EV Generation",
+        limit,
+        systems_size,
+    )
+    overall_image = _rapm_rink_image(
+        overall_against,
+        overall_for,
+        "EV Suppression",
+        "EV Generation",
+        limit,
+        overall_size,
+    )
+    cbar_image = _rapm_cbar_image(limit, cbar_size, plotting_metric)
+    return (
+        _image_to_png_bytes(systems_image),
+        _image_to_png_bytes(cbar_image),
+        _image_to_png_bytes(overall_image),
+    )
+
+
 @lru_cache(maxsize=1)
 def _font_path() -> Path | None:
     candidates = [
@@ -1063,6 +1299,47 @@ def _draw_section_title(
     draw.line((x0, y + 16, x1, y + 16), fill=DIVIDER, width=2)
 
 
+def _draw_fitted_section_title(
+    draw: ImageDraw.ImageDraw,
+    x0: int,
+    x1: int,
+    y: int,
+    title: str,
+    font_size: int = 18,
+    min_size: int = 12,
+):
+    font = _fit_font(draw, title.upper(), x1 - x0 - 8, font_size, min_size)
+    _draw_centered(draw, ((x0 + x1) // 2, y), title.upper(), font)
+    draw.line((x0, y + 16, x1, y + 16), fill=DIVIDER, width=2)
+
+
+def _draw_multiline_section_title(
+    draw: ImageDraw.ImageDraw,
+    x0: int,
+    x1: int,
+    y: int,
+    title: str,
+    font_size: int = 18,
+    spacing: int = 0,
+):
+    font = _font(font_size)
+    lines = [line.strip().upper() for line in str(title).split("\n") if line.strip()]
+    if not lines:
+        lines = [""]
+    heights: list[int] = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        heights.append(bbox[3] - bbox[1])
+    total_height = sum(heights) + spacing * max(0, len(lines) - 1)
+    current_y = y - (total_height / 2)
+    center_x = (x0 + x1) // 2
+    for line, height in zip(lines, heights):
+        _draw_centered(draw, (center_x, int(round(current_y + (height / 2)))), line, font)
+        current_y += height + spacing
+    line_y = int(round(y + (total_height / 2) + 8))
+    draw.line((x0, line_y, x1, line_y), fill=DIVIDER, width=2)
+
+
 def _draw_metric_line(
     draw: ImageDraw.ImageDraw,
     x0: int,
@@ -1115,10 +1392,65 @@ def _draw_metric_line(
         draw.rectangle((bar_x0, bar_y0, bar_x0 + fill_width, bar_y1), fill=color)
 
 
-def _draw_donut(draw: ImageDraw.ImageDraw, center: tuple[int, int], percentile: int):
+def _draw_dual_metric_row(
+    draw: ImageDraw.ImageDraw,
+    x0: int,
+    x1: int,
+    y: int,
+    label: str,
+    offense_value: float | int | None,
+    defense_value: float | int | None,
+    *,
+    row_height: int = 20,
+    label_width: int = 126,
+    column_gap: int = 12,
+):
+    content_width = x1 - x0
+    metric_width = max(80, (content_width - label_width - column_gap) // 2)
+    offense_x0 = x0 + label_width
+    defense_x0 = offense_x0 + metric_width + column_gap
+    label_font = _fit_font(draw, label.upper(), label_width - 8, 12, 9)
+    draw.text((x0 + 2, y + (row_height // 2)), label.upper(), font=label_font, fill=WHITE, anchor="lm")
+
+    def draw_metric_box(metric_x0: int, value: float | int | None):
+        square_side = row_height - 6
+        square_x1 = metric_x0 + square_side
+        bar_x0 = square_x1 + 4
+        bar_x1 = metric_x0 + metric_width
+        bar_y0 = y + 3
+        bar_y1 = bar_y0 + square_side
+        draw.rectangle((metric_x0, bar_y0, square_x1, bar_y1), fill=BLACK)
+        draw.rectangle((bar_x0, bar_y0, bar_x1, bar_y1), fill=BLACK)
+        if value is None or pd.isna(value):
+            return
+        percentile = int(round(float(value)))
+        color = _percentile_color(percentile)
+        draw.rectangle((metric_x0, bar_y0, square_x1, bar_y1), fill=color)
+        _draw_centered_bold(
+            draw,
+            ((metric_x0 + square_x1) // 2, (bar_y0 + bar_y1) // 2 - 1),
+            str(percentile),
+            _font(13),
+            fill=BLACK,
+        )
+        fill_width = int((bar_x1 - bar_x0) * max(0, min(percentile, PERCENTILE_MAX)) / PERCENTILE_MAX)
+        if fill_width > 0:
+            draw.rectangle((bar_x0, bar_y0, bar_x0 + fill_width, bar_y1), fill=color)
+
+    draw_metric_box(offense_x0, offense_value)
+    draw_metric_box(defense_x0, defense_value)
+
+
+def _draw_donut(
+    draw: ImageDraw.ImageDraw,
+    center: tuple[int, int],
+    percentile: int,
+    *,
+    outer: int = 92,
+    inner: int = 46,
+    font_size: int = 72,
+):
     x, y = center
-    outer = 92
-    inner = 46
     ring_color = _percentile_color(percentile)
     ring_bounds = (x - outer + 7, y - outer + 7, x + outer - 7, y + outer - 7)
     start_angle = -90
@@ -1139,7 +1471,7 @@ def _draw_donut(draw: ImageDraw.ImageDraw, center: tuple[int, int], percentile: 
         width=22,
     )
     draw.ellipse((x - inner, y - inner, x + inner, y + inner), fill=BLACK)
-    draw.text((x, y), str(percentile), font=_font(72), fill=WHITE, anchor="mm")
+    draw.text((x, y), str(percentile), font=_font(font_size), fill=WHITE, anchor="mm")
 
 
 def _draw_team_badge(draw: ImageDraw.ImageDraw, center: tuple[int, int], team_abbr: str):
@@ -1405,6 +1737,175 @@ def wsba_skater_card(
             row_height=SECTION_LINE_ROW_HEIGHT,
             label_ratio=SECTION_LABEL_RATIO,
         )
+
+    footer_blue = layout["footer_blue"]
+    footer_red = layout["footer_red"]
+    footer_text_rect = layout["footer_text"]
+    draw.rectangle((footer_blue.left, footer_blue.top, footer_blue.right, footer_blue.bottom), fill=BLUE)
+    draw.rectangle((footer_red.left, footer_red.top, footer_red.right, footer_red.bottom), fill=RED)
+    footer_font = _font(13)
+    draw.text((footer_text_rect.left + 2, footer_text_rect.top), "PERCENTILES ARE RELATIVE TO POSITION AND SEASON", font=footer_font, fill=WHITE)
+    draw.text(
+        (footer_text_rect.left + 2, footer_text_rect.top + 24),
+        "ALL PREREQUISITE DATA IS ACQUIRED FROM THE NHL OR COREY SZNJADER'S ALL THREE ZONES PROJECT.",
+        font=_font(12),
+        fill=WHITE,
+    )
+
+    if WSBA_LOGO_PATH.exists():
+        logo = Image.open(WSBA_LOGO_PATH).convert("RGBA")
+        logo = ImageOps.contain(logo, (48, 48))
+        image.paste(logo, (footer_red.right - 54, footer_text_rect.top - 2), logo)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output)
+    return image
+
+
+def wsba_coach_card(
+    coach_name: str,
+    seasons: list[int],
+    output_path: str | Path | None = None,
+    card_layout: dict[str, PixelRect] | None = None,
+    plotting_metric: str = "fenwick",
+) -> Image.Image:
+    plotting_metric = _normalize_rapm_plotting_metric(plotting_metric)
+    dataset = _coach_card_dataset(seasons)
+    coach_key = str(coach_name or "").strip().upper()
+    row = dataset.loc[dataset["coach_name"].astype(str).str.upper().eq(coach_key)]
+    if row.empty:
+        raise ValueError(f"Coach {coach_name} was not found in {COACH_GAR_DATA_PATH}.")
+
+    coach = row.iloc[0]
+    output = Path(output_path) if output_path is not None else DEFAULT_OUTPUT_PATH
+    layout = _resolve_coach_card_layout(card_layout)
+    team_primary, team_secondary = _team_colors(str(coach["team_abbr"]))
+
+    image = Image.new("RGB", CARD_SIZE, BLACK)
+    draw = ImageDraw.Draw(image)
+    _draw_background(draw)
+
+    name = str(coach["coach_name"]).upper()
+    title_rect = layout["title"]
+    name_font = _fit_font(draw, name, title_rect.width, 42, 22)
+    _draw_centered(draw, (title_rect.center_x, title_rect.center_y), name, name_font)
+
+    top_bar = layout["header_bar"]
+    draw.rectangle((top_bar.left, top_bar.top, top_bar.right, top_bar.bottom), fill=team_primary)
+
+    _paste_team_logo(image, layout["identity_logo"], str(coach["team_abbr"]))
+    season_rect = layout["season_label"]
+    _draw_centered(draw, (season_rect.center_x, season_rect.center_y), str(coach.get("season_label") or _season_label(seasons)), _font(18))
+
+    info_divider = layout["info_divider"]
+    draw.rectangle((info_divider.left, info_divider.top, info_divider.right, info_divider.bottom), fill=team_secondary)
+
+    _draw_section_title(
+        draw,
+        layout["systems_title"].left,
+        layout["systems_title"].right,
+        layout["systems_title"].center_y,
+        "Systems",
+        font_size=17,
+    )
+    _draw_fitted_section_title(
+        draw,
+        layout["offense_score_title"].left,
+        layout["offense_score_title"].right,
+        layout["offense_score_title"].center_y,
+        "Offensive Score State Impacts",
+        font_size=18,
+        min_size=12,
+    )
+    _draw_fitted_section_title(
+        draw,
+        layout["defense_score_title"].left,
+        layout["defense_score_title"].right,
+        layout["defense_score_title"].center_y,
+        "Defensive Score State Impacts",
+        font_size=18,
+        min_size=12,
+    )
+
+    systems_title_rect = layout["locational_title_systems"]
+    _draw_section_title(
+        draw,
+        systems_title_rect.left,
+        systems_title_rect.right,
+        systems_title_rect.center_y,
+        "Systems Locational Impacts",
+        font_size=14,
+    )
+    overall_title_rect = layout["locational_title_overall"]
+    _draw_section_title(
+        draw,
+        overall_title_rect.left,
+        overall_title_rect.right,
+        overall_title_rect.center_y,
+        "Overall Locational Impacts",
+        font_size=14,
+    )
+
+    systems_panel = layout["systems_panel"]
+    systems_lines = [
+        MetricLine("EV Generation", coach.get("even_strength_generation_percentile")),
+        MetricLine("EV Suppression", coach.get("even_strength_suppression_percentile")),
+        MetricLine("Taken Penalties", coach.get("taken_penalties_percentile")),
+        MetricLine("Drawn Penalties", coach.get("drawn_penalties_percentile")),
+        MetricLine("GAR", coach.get("goals_above_replacement_percentile")),
+    ]
+    systems_offsets = [0, 20, 40, 60, 80]
+    for line, offset in zip(systems_lines, systems_offsets):
+        _draw_metric_line(
+            draw,
+            systems_panel.left + 4,
+            systems_panel.right - 4,
+            systems_panel.top + offset,
+            line,
+            row_height=20,
+            label_ratio=0.48,
+        )
+
+    offense_panel = layout["offense_score_panel"]
+    defense_panel = layout["defense_score_panel"]
+    for idx, (label, state) in enumerate(COACH_SCORE_STATE_ROWS):
+        y = offense_panel.top + 2 + idx * 43
+        _draw_metric_line(
+            draw,
+            offense_panel.left + 4,
+            offense_panel.right - 4,
+            y,
+            MetricLine(label, coach.get(f"{state}_even_strength_generation_percentile")),
+            row_height=26,
+            label_ratio=0.4,
+        )
+        _draw_metric_line(
+            draw,
+            defense_panel.left + 4,
+            defense_panel.right - 4,
+            y,
+            MetricLine(label, coach.get(f"{state}_even_strength_suppression_percentile")),
+            row_height=26,
+            label_ratio=0.4,
+        )
+
+    try:
+        systems_bytes, cbar_bytes, overall_bytes = _coach_rapm_panel_images_cached(
+            str(coach["coach_name"]),
+            _seasons_key(seasons),
+            plotting_metric,
+            (layout["locational_panel_systems"].width, layout["locational_panel_systems"].height),
+            (layout["locational_panel_overall"].width, layout["locational_panel_overall"].height),
+            (layout["locational_cbar"].width, layout["locational_cbar"].height),
+        )
+        systems_image = _image_from_png_bytes(systems_bytes)
+        cbar_image = _image_from_png_bytes(cbar_bytes)
+        overall_image = _image_from_png_bytes(overall_bytes)
+        image.paste(systems_image, (layout["locational_panel_systems"].left, layout["locational_panel_systems"].top), systems_image)
+        image.paste(cbar_image, (layout["locational_cbar"].left, layout["locational_cbar"].top), cbar_image)
+        image.paste(overall_image, (layout["locational_panel_overall"].left, layout["locational_panel_overall"].top), overall_image)
+    except Exception:
+        pass
 
     footer_blue = layout["footer_blue"]
     footer_red = layout["footer_red"]

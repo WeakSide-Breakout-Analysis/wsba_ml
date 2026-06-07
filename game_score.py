@@ -3,9 +3,10 @@ import pandas as pd
 import numpy as np
 import wsba_hockey as wsba
 from functools import reduce
+from pathlib import Path
 from sklearn.ensemble import RandomForestRegressor
 
-MODEL_PATH = 'wsba_ml/game_score/wsba_game_score.pkl'
+MODEL_PATH = Path(__file__).resolve().parent / 'game_score' / 'wsba_game_score.pkl'
 
 BIO = ['game_id','player_id','season','team_abbr']
 GS_TARGET = 'goal_differential'
@@ -24,27 +25,17 @@ GS_VARIABLES = [
     'secondary_expected_assists',
     'takeaways',
     'giveaways',
-    'hits_for',
-    'hits_against',
+    'hits_applied',
+    'hits_received',
     'blocked_shots',
-    'penalties',
+    'penalties_taken',
     'penalties_drawn',
     'faceoff_wins',
     'faceoff_losses'
 ]
 
-GAME_SCORE_SCHEMA_ALIASES = {
-    'hits_for': 'hits_applied',
-    'hits_against': 'hits_received',
-    'penalties': 'penalties_taken',
-}
-
 def normalize_game_score_schema(stats):
     stats = stats.copy()
-
-    for target, source in GAME_SCORE_SCHEMA_ALIASES.items():
-        if target not in stats.columns and source in stats.columns:
-            stats[target] = stats[source]
 
     for col in BIO + [GS_TARGET] + GS_VARIABLES:
         if col not in stats.columns and col != GS_TARGET:
@@ -92,10 +83,10 @@ def prepare_game_score(stats):
         'secondary_expected_assists',
         'takeaways',
         'giveaways',
-        'hits_for',
-        'hits_against',
+        'hits_applied',
+        'hits_received',
         'blocked_shots',
-        'penalties',
+        'penalties_taken',
         'penalties_drawn',
         'faceoff_wins',
         'faceoff_losses'
@@ -133,10 +124,11 @@ def wsba_game_score(stats, train=False):
         )
         model.fit(predictors, target, sample_weight=weight)
 
-        with open(MODEL_PATH, 'wb') as f:
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MODEL_PATH.open('wb') as f:
             pickle.dump(model, f)
     else:
-        with open(MODEL_PATH, 'rb') as f:
+        with MODEL_PATH.open('rb') as f:
             model = pickle.load(f)
     
     predictors = df[GS_VARIABLES].values

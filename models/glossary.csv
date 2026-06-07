@@ -1,0 +1,49 @@
+metric_id,metric_abbr,metric_name,description
+time_on_ice,TOI,Time On Ice,Number of minutes spent on the ice.
+time_on_ice_per_games_played,TOI / GP,Time On Ice Per Game,Average number of minutes spent on the ice per game.
+games_played,GP,Games Played,Number of games a skater appeared on the ice at least once in.
+goals,G,Goals,Goals scored by the player or team.
+primary_assists,A1,Primary Assists,Number of times a player was second-to-last to touch the puck before the goal was scored
+secondary_assists,A2,Secondary Assists,Number of times a player was third-to-last to touch the puck before the goal was scored
+points,P,Points,"Sum of goals, primary assists, and secondary assists"
+shots,iSF,Individual Shots On Goal,Number of shot attempts taken which would have entered the net but were stopped by the opposing goaltender
+fenwick,iFF,Individual Fenwick,Number of shot attempts taken that are not blocked by an opposing skater
+corsi,iCF,Individual Corsi,Number of all shot attempts taken
+expected_goals,ixG,Individual Expected Goals,Sum of expected goal values assigned to unblocked shot attempts taken
+primary_expected_assists,ixA1,Primary Expected Assists,Sum of expected goal values assigned to unblocked shot attempts taken off the second-to-last touch of the puck before the shot attempt.
+secondary_expected_assists,ixA2,Secondary Expected Assists,Sum of expected goal values assigned to unblocked shot attempts taken off the third-to-last touch of the puck before the shot attempt
+primary_fenwick_assists,ixFA1,Primary Fenwick Assists,Number of unblocked shot attempts taken off the second-to-last touch of the puck.  Most values presented are estimated using a specific imputation method.
+secondary_fenwick_assists,ixFA2,Secondary Fenwick Assists,Number of unblocked shot attempts taken off the second-to-last touch of the puck.  Most values presented are estimated using a specific imputation method.
+expected_points,ixP,Expected Points,"Sum of expected goals, primary expected assists, and secondary expected assists."
+goals_for,GF,Goals For,Goals scored while the player or unit was on the ice.
+goals_against,GA,Goals Against,Goals allowed while the player or unit was on the ice.
+shots_for,SF,Shots For,Shots on goal for while on the ice.
+shots_against,SA,Shots Against,Shots on goal against while on the ice.
+fenwick_for,FF,Fenwick For,Unblocked attempts for while on the ice.
+fenwick_against,FA,Fenwick Against,Unblocked attempts against while on the ice.
+corsi_for,CF,Corsi For,All shot attempts for while on the ice.
+corsi_against,CA,Corsi Against,All shot attempts against while on the ice.
+goals_for_percentage,GF%,Goals For Percentage,Share of on-ice goals that were for the player or team.
+shots_for_percentage,SF%,Shots For Percentage,Share of on-ice shots on goal that were for the player or team.
+fenwick_for_percentage,FF%,Fenwick For Percentage,Share of on-ice unblocked attempts that were for the player or team.
+corsi_for_percentage,CF%,Corsi For Percentage,Share of on-ice shot attempts that were for the player or team.
+blocked_shots,BLK,Blocked Shots,Shots blocked by the skater or team.
+giveaways,GIVE,Giveaways,Turnovers charged to the player or team.
+takeaways / taken_penalties,TAKE,Takeaways,Turnovers created by a player or team.
+faceoff_wins,FW,Faceoff Wins,Faceoffs won.
+faceoff_losses,FL,Faceoff Losses,Faceoffs lost.
+faceoff_percentage,F%,Faceoff Percentage,Faceoff win rate.
+penalty_minutes,PIM,Penalty Minutes,Minutes assessed in penalties.
+even_strength_generation,EV GEN,Even-Strength Generation,GAR offense contribution at even strength.
+even_strength_suppression,EV SUP,Even-Strength Suppression,GAR defense contribution at even strength.
+power_play_generation,PP GEN,Power-Play Generation,GAR offense contribution on the power play.
+penalty_kill_suppression,PK SUP,Penalty-Kill Suppression,GAR defense contribution on the penalty kill.
+finishing,FIN,Finishing,GAR value from converting chances into goals.
+induction,IND,Induction,GAR value from setting up teammates' offense.
+taken_penalties,TAKE PENS,Taken Penalties,GAR value from penalties taken.
+drawn_penalties,DRAW PENS,Drawn Penalties,GAR value from penalties drawn.
+goals_above_replacement,GAR,Goals Above Replacement,Total value above replacement level.
+expected_goals_above_replacement,xGAR,Expected Goals Above Replacement,Expected-value version of GAR.
+offense,OFF,Offense,GAR offense total.
+defense,DEF,Defense,GAR defense total.
+penalties,PENS,Penalties,Combined penalty GAR contribution.

@@ -37,6 +37,7 @@ def skater_dataset(seasons=DEFAULT_SEASONS, data_path=SENSE_DATA, scrape=False, 
 
     if scrape:
         data = nhl_build_dataset(seasons, True)
+        data['season_type'] = data['season_type'].astype(int)
         
         FORMATS['write'][format](data, export)
     else:

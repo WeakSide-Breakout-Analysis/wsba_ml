@@ -7,15 +7,14 @@ def qoc_qot(pbp, stats):
 
     away_cols = [f'away_on_{i}_id' for i in range(1, 7)]
     home_cols = [f'home_on_{i}_id' for i in range(1, 7)]
-    context_cols = ['season', 'event_length']
 
-    # convert columns to numpy arrays
+    # Convert columns to numpy arrays
     season_arr = pbp['season'].to_numpy()
     event_len_arr = pbp['event_length'].to_numpy()
     away_arr = pbp[away_cols].to_numpy()
     home_arr = pbp[home_cols].to_numpy()
 
-    # function to generate pairs efficiently
+    # Dunction to generate pairs efficiently
     def generate_pairs(arr1, arr2, interaction):
         n_events = arr1.shape[0]
         idx1, idx2 = np.meshgrid(np.arange(arr1.shape[1]), np.arange(arr2.shape[1]), indexing='ij')
@@ -34,10 +33,10 @@ def qoc_qot(pbp, stats):
             'partner_id': partner[mask],
             'season': seasons_expanded[mask],
             'interaction': interaction_arr[mask],
-            'time_on_ice': toi_expanded[mask] / 60  # convert to minutes immediately
+            'time_on_ice': toi_expanded[mask] / 60
         })
 
-    # teammate pairs (exclude diagonal)
+    # Teammate pairs (exclude diagonal)
     def teammate_pairs(arr):
         n = arr.shape[1]
         idx1, idx2 = np.triu_indices(n, k=1)

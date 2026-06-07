@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 import scipy.sparse as sp
 import xgboost as xgb
-from wsba_ml.nhl_obj import NHLTeam
+from wsba_ml.nhl_obj import NHLTeam, COACH_SCORE_STRENGTH_PREFIXES
 from wsba_ml.rapm import decode_rapm_map, rink_grid_format, MAP_X, MAP_Y, MAP_SHAPE, MAP_SIZE
 
 ### WSBA NHL Simulator ###
@@ -37,7 +37,7 @@ PENALTIES = 3.0702651883385172
 RAPM_CONTEXT_PREDICTORS = {
     'period_2',
     'period_3',
-    'period_4',
+    'period_4_plus',
     'offensive_faceoff',
     'defensive_faceoff',
     'lead_1',
@@ -336,13 +336,41 @@ def _score_predictor(score_diff):
     return None
 
 
+def _coach_score_state(score_diff):
+    score_state = _score_predictor(score_diff)
+    return score_state if score_state is not None else 'tied'
+
+
+def _coach_score_strength_prefix(role):
+    if role == 'pp':
+        return COACH_SCORE_STRENGTH_PREFIXES['power_play']
+    if role == 'pk':
+        return COACH_SCORE_STRENGTH_PREFIXES['penalty_kill']
+    return COACH_SCORE_STRENGTH_PREFIXES['even_strength']
+
+
+def _coach_score_state_adjustment_per60(team, score_state, metric, side, role):
+    coach = getattr(team, 'coach', None)
+    if coach is None:
+        return 0.0
+
+    column = f'rapm_{score_state}_{metric}_{side}_per_sixty'
+    prefix = _coach_score_strength_prefix(role)
+    value = getattr(coach, f'{prefix}_{column}', None)
+    if value is None or pd.isna(value):
+        value = getattr(coach, column, 0.0)
+    if value is None or pd.isna(value):
+        return 0.0
+    return float(value)
+
+
 def _period_predictors(period_number, reg_periods, season_type):
     if period_number == 2:
         return ('period_2',)
     if period_number == 3:
         return ('period_3',)
-    if period_number == 4 and not (season_type == 3 and period_number > reg_periods):
-        return ('period_4',)
+    if period_number >= 4:
+        return ('period_4_plus',)
     return ()
 
 
@@ -1070,6 +1098,30 @@ class WSBASimulation:
 
             return adjustment
 
+        def _coach_context_adjustment_per60(venue, role):
+            offense_score_state = _coach_score_state(
+                _score_diff_for_venue(venue, sim_game.home_score, sim_game.away_score)
+            )
+
+            if venue == 'home':
+                offense_team = home
+                defense_team = away
+                defense_venue = 'away'
+                defense_role = _venue_role('away', sim_game.strength_state)
+            else:
+                offense_team = away
+                defense_team = home
+                defense_venue = 'home'
+                defense_role = _venue_role('home', sim_game.strength_state)
+            defense_score_state = _coach_score_state(
+                _score_diff_for_venue(defense_venue, sim_game.home_score, sim_game.away_score)
+            )
+
+            return (
+                _coach_score_state_adjustment_per60(offense_team, offense_score_state, 'corsi', 'for', role)
+                + _coach_score_state_adjustment_per60(defense_team, defense_score_state, 'corsi', 'against', defense_role)
+            )
+
         def _select_event(strength_state):
             # Randomly select a second's event, if any
             score_diff = sim_game.home_score - sim_game.away_score
@@ -1135,6 +1187,8 @@ class WSBASimulation:
                 home_model_name = 'power_play' if home_role in {'pp', 'pk'} else 'even_strength'
                 away_corsi += _context_adjustment_per60(away_model_name, 'away', away_role) / 3600.0
                 home_corsi += _context_adjustment_per60(home_model_name, 'home', home_role) / 3600.0
+                away_corsi += _coach_context_adjustment_per60('away', away_role) / 3600.0
+                home_corsi += _coach_context_adjustment_per60('home', home_role) / 3600.0
 
                 if away_corsi < 0.0 or not np.isfinite(away_corsi):
                     away_corsi = 0.0

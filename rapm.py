@@ -1,7 +1,6 @@
 import base64
 import json
 import zlib
-from pathlib import Path
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
@@ -10,17 +9,18 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from functools import reduce
 from wsba_hockey.tools.plotting import wsba_rink
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.linear_model import Ridge, LogisticRegression
-from sklearn.model_selection import RandomizedSearchCV
-from scipy.sparse.linalg import splu
+from sklearn.linear_model import LogisticRegression
+from scipy.sparse.linalg import cg, splu
 from matplotlib.colors import LinearSegmentedColormap
 from scipy.ndimage import gaussian_filter
+from scipy.stats import norm
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_FEATURES = {
     'shifts':{
         ('expected_goals', 'goals', 'corsi', 'fenwick', 'shots', 'penalty_minutes'): [
-            'period_2', 'period_3', 'period_4',
+            'period_2', 'period_3', 'period_4_plus',
             'offensive_faceoff', 'neutral_faceoff', 'defensive_faceoff',
             'lead_1', 'lead_2', 'lead_3_plus',
             'behind_1', 'behind_2', 'behind_3_plus',
@@ -30,7 +30,7 @@ DEFAULT_FEATURES = {
             'is_home',
             'strength_3v3', 'strength_3v4', 'strength_3v5',
             'strength_4v3', 'strength_4v4', 'strength_4v5',
-            'strength_5v3', 'strength_5v4',
+            'strength_5v3', 'strength_5v4'
         ],
     },
     'shots':{
@@ -53,19 +53,19 @@ MAP_Y = RINK_Y
 MAP_SHAPE = (len(MAP_X), len(MAP_Y))
 MAP_SIZE = MAP_SHAPE[0] * MAP_SHAPE[1]
 MAP_TARGETS = {'fenwick', 'shots', 'goals', 'expected_goals'}
-MAP_BLOCK_SIZE = 128
+MAP_BLOCK_SIZE = 512
 
-def _parse_strength(strength):
+def parse_strength(strength):
     try:
         left, right = str(strength).split('v')
         return int(left), int(right)
     except (TypeError, ValueError):
         return None
 
-def _reference_strength(strengths):
+def reference_strength(strengths):
     candidates = []
     for strength in strengths:
-        parsed = _parse_strength(strength)
+        parsed = parse_strength(strength)
         if parsed is None:
             continue
         left, right = parsed
@@ -85,7 +85,7 @@ def decode_rapm_map(encoded_map):
     data = np.frombuffer(zlib.decompress(base64.b64decode(encoded_map)), dtype=np.float16).astype(np.float32)
     return data.reshape(MAP_SHAPE)
 
-def _season_values(season):
+def season_values(season):
     if season is None:
         return None
     if isinstance(season, (list, tuple, set, np.ndarray, pd.Series)):
@@ -94,6 +94,29 @@ def _season_values(season):
     if pd.isna(season):
         return None
     return (int(season),)
+
+def center_series(frame, column):
+    if column not in frame.columns:
+        return
+    values = pd.to_numeric(frame[column], errors='coerce')
+    mean = values.mean()
+    if pd.isna(mean):
+        return
+    frame[column] = values - mean
+    for suffix in ['ci_lower', 'ci_upper']:
+        interval_col = f'{column}_{suffix}'
+        if interval_col in frame.columns:
+            frame[interval_col] = pd.to_numeric(frame[interval_col], errors='coerce') - mean
+    se_col = f'{column}_standard_error'
+    if se_col in frame.columns:
+        frame[f'{column}_p_value'] = coefficient_p_values(frame[column], frame[se_col])
+
+
+def center_rapm_columns(frame, value_columns):
+    frame = frame.copy()
+    for column in value_columns:
+        center_series(frame, column)
+    return frame
 
 def transform_rapm_map(encoded_map, reverse_x=False, reverse_y=False):
     grid = decode_rapm_map(encoded_map)
@@ -111,10 +134,9 @@ def encode_raw_maps(raw_maps):
         encoded_maps.extend([encode_rapm_map(grid) for grid in batch])
     return encoded_maps
 
-def shift_cols(max_periods):
+def shift_cols():
     return [
         'season', 'game_id', 'shift_id', 'score_state',
-        *[f'period_{i}' for i in range(1,max_periods+1)],
         'offense_team_abbr', 'defense_team_abbr',
         *[f'offense_on_{i}_id' for i in range(1,7)],
         *[f'defense_on_{i}_id' for i in range(1,7)],
@@ -122,7 +144,9 @@ def shift_cols(max_periods):
         'offense_coach', 'defense_coach',
         *[f'{stat}_for' for stat in RAPM_STATS],
         *[f'{stat}_for_per_sixty' for stat in RAPM_STATS],
+        'period_2', 'period_3', 'period_4_plus',
         'offensive_faceoff', 'neutral_faceoff', 'defensive_faceoff', 'on_the_fly',
+        'tied',
         'lead_1', 'lead_2', 'lead_3_plus',
         'behind_1', 'behind_2', 'behind_3_plus',
         'offense_back_to_back', 'defense_back_to_back',
@@ -133,9 +157,24 @@ def shift_cols(max_periods):
 
 def select_target_predictors(sparse, predictor_names, target, feature_filters=None):
     predictor_names = list(predictor_names)
+    # Treat only encoded entity dummy columns as entity terms. Contextual
+    # features like offense_back_to_back / defense_back_to_back should remain
+    # scalar context predictors and be preserved in saved coefficient CSVs.
+    context_entity_exceptions = {'offense_back_to_back', 'defense_back_to_back'}
     entity_mask = np.array([
         (
-            name.startswith(('offense', 'defense', 'offense_coach_', 'defense_coach_', 'shooter_', 'goalie_', 'primary_passer_', 'secondary_passer_', 'tertiary_passer_'))
+            name.startswith((
+                'offense_',
+                'defense_',
+                'offense_coach_',
+                'defense_coach_',
+                'shooter_',
+                'goalie_',
+                'primary_passer_',
+                'secondary_passer_',
+                'tertiary_passer_',
+            ))
+            and name not in context_entity_exceptions
         )
         for name in predictor_names
     ], dtype=bool)
@@ -172,6 +211,72 @@ def select_target_predictors(sparse, predictor_names, target, feature_filters=No
         'entity_mask': entity_mask[selected_mask],
         'context_mask': (~entity_mask)[selected_mask]
     }
+
+
+def columns_to_csr(frame, columns):
+    if not columns:
+        return sp.csr_matrix((len(frame), len(columns)), dtype=np.float64)
+    dense = frame.loc[:, columns].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+    return sp.csr_matrix(dense, dtype=np.float64)
+
+
+def entity_labels(ids, seasons, teams):
+    ids = np.asarray(ids)
+    seasons = np.asarray(seasons, dtype=str)
+    teams = np.asarray(teams, dtype=str)
+    return np.char.add(
+        np.char.add(np.char.add(ids.astype(np.int64).astype(str), '_'), seasons),
+        np.char.add('_', teams)
+    )
+
+
+def indicator_sparse(player_arr, seasons, teams):
+    player_arr = np.asarray(player_arr)
+    n_rows, n_slots = player_arr.shape
+    flat_ids = player_arr.reshape(-1)
+    valid = flat_ids != 0
+    if not np.any(valid):
+        return sp.csr_matrix((n_rows, 0), dtype=np.float64), np.array([], dtype=object)
+
+    row_idx = np.repeat(np.arange(n_rows, dtype=np.int32), n_slots)[valid]
+    season_idx = np.repeat(np.asarray(seasons, dtype=str), n_slots)[valid]
+    team_idx = np.repeat(np.asarray(teams, dtype=str), n_slots)[valid]
+    labels = entity_labels(flat_ids[valid], season_idx, team_idx)
+    col_idx, classes = pd.factorize(labels, sort=True)
+    values = np.ones(len(col_idx), dtype=np.float64)
+    sparse = sp.csr_matrix((values, (row_idx, col_idx)), shape=(n_rows, len(classes)), dtype=np.float64)
+    sparse.sum_duplicates()
+    return sparse, np.asarray(classes, dtype=object)
+
+
+def coach_sparse(coach_arr, seasons, teams, score_state_frame):
+    coach_arr = np.asarray(coach_arr, dtype=str)
+    seasons = np.asarray(seasons, dtype=str)
+    teams = np.asarray(teams, dtype=str)
+    n_rows = len(coach_arr)
+
+    base_labels = np.char.add(
+        np.char.add(np.char.add(coach_arr, '_'), seasons),
+        np.char.add('_', teams)
+    )
+    row_parts = [np.arange(n_rows, dtype=np.int32)]
+    label_parts = [base_labels]
+
+    for state in ['tied', 'lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']:
+        active = score_state_frame[state].to_numpy(dtype=np.int8, copy=False) == 1
+        if not np.any(active):
+            continue
+        state_labels = np.char.add(f'{state}_', base_labels[active])
+        row_parts.append(np.flatnonzero(active).astype(np.int32))
+        label_parts.append(state_labels)
+
+    rows = np.concatenate(row_parts)
+    labels = np.concatenate(label_parts)
+    col_idx, classes = pd.factorize(labels, sort=True)
+    values = np.ones(len(col_idx), dtype=np.float64)
+    sparse = sp.csr_matrix((values, (rows, col_idx)), shape=(n_rows, len(classes)), dtype=np.float64)
+    sparse.sum_duplicates()
+    return sparse, np.asarray(classes, dtype=object)
 
 def build_shift_map_targets(events, sbs):
     keys = sbs[['season', 'game_id', 'shift_id', 'is_home']].copy().reset_index(drop=True)
@@ -218,24 +323,82 @@ def build_shift_map_targets(events, sbs):
 
     return responses
 
-def fit_shift_map_model(sparse, weights, response, predictor_names, alpha, selected_masks):
+def penalized_system(sparse, weights, penalty):
     weights = np.asarray(weights, dtype=np.float64)
     weighted_sparse = sparse.multiply(weights[:, None])
     xtwx = (sparse.T @ weighted_sparse).tocsc()
-    diag = xtwx.diagonal()
-    xtwx.setdiag(diag + alpha)
-
     xw = np.asarray(sparse.T @ weights).ravel()
-    system = sp.bmat(
+    return penalized_system_from_components(xtwx, xw, weights.sum(), penalty)
+
+
+def normal_components(sparse, weights):
+    weights = np.asarray(weights, dtype=np.float64)
+    weighted_sparse = sparse.multiply(weights[:, None])
+    xtwx = (sparse.T @ weighted_sparse).tocsc()
+    xw = np.asarray(sparse.T @ weights).ravel()
+    return xtwx, xw, weights.sum()
+
+
+def penalized_system_from_components(xtwx, xw, weight_sum, penalty):
+    xtwx = xtwx.copy()
+    diag = xtwx.diagonal()
+    xtwx.setdiag(diag + penalty)
+
+    return sp.bmat(
         [
-            [sp.csc_matrix([[weights.sum()]]), sp.csc_matrix(xw.reshape(1, -1))],
+            [sp.csc_matrix([[weight_sum]]), sp.csc_matrix(xw.reshape(1, -1))],
             [sp.csc_matrix(xw.reshape(-1, 1)), xtwx]
         ],
         format='csc'
     )
 
-    lu = splu(system)
-    groups = {}
+
+def normalize_workers(workers):
+    if workers is None:
+        return 1
+    return max(int(workers), 1)
+
+
+def solve_map_blocks(system, sparse, response, block_ranges, group_indices):
+    solver = splu(system)
+    solved = []
+    for start, end in block_ranges:
+        block = response[:, start:end]
+        rhs = sp.vstack(
+            [
+                sp.csr_matrix(block.sum(axis=0)),
+                sparse.T @ block,
+            ],
+            format='csc'
+        )
+        solution = solver.solve(rhs.toarray() * 3600.0)
+        solved.append((
+            start,
+            end,
+            {
+                key: np.asarray(solution[np.where(idx < 0, 0, idx + 1), :], dtype=np.float32)
+                for key, idx in group_indices.items()
+                if len(idx) > 0
+            }
+        ))
+    return solved
+
+
+def fit_shift_map_model(sparse, weights, response, predictor_names, alpha, selected_masks, system=None, solver=None, solve_workers=1):
+    weights = np.asarray(weights, dtype=np.float64)
+    if system is None:
+        system = penalized_system(sparse, weights, alpha)
+    solve_workers = normalize_workers(solve_workers)
+    if solver is None and solve_workers == 1:
+        solver = splu(system)
+
+    groups = {
+        'intercept': {
+            'idx': np.array([-1], dtype=int),
+            'names': ['(intercept)'],
+            'raw_maps': np.zeros((1, MAP_SIZE), dtype=np.float32)
+        }
+    }
     for key, mask in selected_masks.items():
         selected_idx = np.flatnonzero(np.asarray(mask, dtype=bool))
         groups[key] = {
@@ -244,18 +407,46 @@ def fit_shift_map_model(sparse, weights, response, predictor_names, alpha, selec
             'raw_maps': np.zeros((len(selected_idx), MAP_SIZE), dtype=np.float32)
         }
 
-    for start in range(0, response.shape[1], MAP_BLOCK_SIZE):
-        end = min(start + MAP_BLOCK_SIZE, response.shape[1])
-        block = response[:, start:end]
-        rhs = np.vstack([
-            3600.0 * np.asarray(block.sum(axis=0)).ravel()[None, :],
-            3600.0 * (sparse.T @ block).toarray()
-        ])
-        solution = lu.solve(rhs)
-        for group in groups.values():
-            if len(group['idx']) == 0:
-                continue
-            group['raw_maps'][:, start:end] = solution[group['idx'] + 1, :].astype(np.float32)
+    block_ranges = [(start, min(start + MAP_BLOCK_SIZE, response.shape[1])) for start in range(0, response.shape[1], MAP_BLOCK_SIZE)]
+    group_indices = {key: group['idx'] for key, group in groups.items()}
+    if solver is not None:
+        solved = []
+        for start, end in block_ranges:
+            block = response[:, start:end]
+            rhs = sp.vstack(
+                [
+                    sp.csr_matrix(block.sum(axis=0)),
+                    sparse.T @ block,
+                ],
+                format='csc'
+            )
+            solution = solver.solve(rhs.toarray() * 3600.0)
+            solved.append((
+                start,
+                end,
+                {
+                    key: np.asarray(solution[np.where(idx < 0, 0, idx + 1), :], dtype=np.float32)
+                    for key, idx in group_indices.items()
+                    if len(idx) > 0
+                }
+            ))
+        solved_groups = [solved]
+    elif solve_workers == 1:
+        solved_groups = [solve_map_blocks(system, sparse, response, block_ranges, group_indices)] if solver is None else []
+    else:
+        chunks = [chunk.tolist() for chunk in np.array_split(np.asarray(block_ranges, dtype=object), solve_workers) if len(chunk) > 0]
+        with ThreadPoolExecutor(max_workers=solve_workers) as executor:
+            solved_groups = list(
+                executor.map(
+                    lambda chunk: solve_map_blocks(system, sparse, response, chunk, group_indices),
+                    chunks
+                )
+            )
+
+    for solved in solved_groups:
+        for start, end, values_by_group in solved:
+            for key, values in values_by_group.items():
+                groups[key]['raw_maps'][:, start:end] = values
 
     results = {}
     for key, group in groups.items():
@@ -263,6 +454,228 @@ def fit_shift_map_model(sparse, weights, response, predictor_names, alpha, selec
         results[key] = (group['names'], scalar_values, encode_raw_maps(group['raw_maps']))
 
     return results
+
+def interval_names(source, dest):
+    return {
+        source: dest,
+        f'{source}_standard_error': f'{dest}_standard_error',
+        f'{source}_margin_of_error': f'{dest}_margin_of_error',
+        f'{source}_p_value': f'{dest}_p_value',
+        f'{source}_ci_lower': f'{dest}_ci_lower',
+        f'{source}_ci_upper': f'{dest}_ci_upper'
+    }
+
+def coefficient_p_values(values, standard_errors):
+    values = np.asarray(values, dtype=np.float64)
+    standard_errors = np.asarray(standard_errors, dtype=np.float64)
+    z_scores = np.divide(
+        values,
+        standard_errors,
+        out=np.full_like(values, np.nan, dtype=np.float64),
+        where=standard_errors > 0
+    )
+    return (2.0 * norm.sf(np.abs(z_scores))).tolist()
+
+
+def coef_vector(model, shot):
+    intercept = float(model.intercept_[0]) if shot else float(model.intercept_)
+    coefs = model.coef_.ravel() if shot else np.asarray(model.coef_, dtype=np.float64)
+    return np.concatenate(([intercept], np.asarray(coefs, dtype=np.float64)))
+
+
+class _SparseRidgeModel:
+    def __init__(self, coef_vector):
+        coef_vector = np.asarray(coef_vector, dtype=np.float64)
+        self.intercept_ = float(coef_vector[0])
+        self.coef_ = coef_vector[1:]
+
+    def predict(self, sparse):
+        return np.asarray(sparse @ self.coef_, dtype=np.float64) + self.intercept_
+
+
+def shot_estimator(optimal, target_params):
+    return LogisticRegression(
+        C=optimal,
+        penalty='l2',
+        fit_intercept=True,
+        max_iter=target_params['max_iter'],
+        random_state=42
+    )
+
+
+def fit_sparse_ridge(sparse, target, sample_weight, alpha, factorize=True, tol=1e-8, maxiter=None, system_components=None):
+    weights = np.ones(sparse.shape[0], dtype=np.float64) if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if system_components is None:
+        system = penalized_system(sparse, weights, alpha)
+    else:
+        system = penalized_system_from_components(*system_components, alpha)
+    weighted_target = weights * target
+    rhs = np.concatenate((
+        [weighted_target.sum()],
+        np.asarray(sparse.T @ weighted_target).ravel()
+    ))
+
+    if factorize:
+        solver = splu(system)
+        coefficients = np.asarray(solver.solve(rhs), dtype=np.float64)
+    else:
+        coefficients, info = cg(system, rhs, rtol=tol, atol=0.0, maxiter=maxiter)
+        solver = None
+        if info != 0:
+            solver = splu(system)
+            coefficients = np.asarray(solver.solve(rhs), dtype=np.float64)
+
+    return _SparseRidgeModel(coefficients), system, solver
+
+
+def inverse_diag_blocks(system, indices, block_size=512):
+    solver = splu(system)
+    diag = np.zeros(len(indices), dtype=np.float64)
+    n = system.shape[0]
+    for start in range(0, len(indices), block_size):
+        end = min(start + block_size, len(indices))
+        cols = indices[start:end]
+        rhs = np.zeros((n, len(cols)), dtype=np.float64)
+        rhs[cols, np.arange(len(cols), dtype=int)] = 1.0
+        solution = solver.solve(rhs)
+        diag[start:end] = np.asarray(solution)[cols, np.arange(len(cols), dtype=int)]
+    return diag
+
+
+def inverse_diag(system, indices=None, block_size=512, solver=None, solve_workers=1):
+    solve_workers = normalize_workers(solve_workers)
+    n = system.shape[0]
+    indices = np.arange(n, dtype=int) if indices is None else np.asarray(indices, dtype=int)
+
+    if solver is not None:
+        diag = np.zeros(len(indices), dtype=np.float64)
+        for start in range(0, len(indices), block_size):
+            end = min(start + block_size, len(indices))
+            cols = indices[start:end]
+            rhs = np.zeros((n, len(cols)), dtype=np.float64)
+            rhs[cols, np.arange(len(cols), dtype=int)] = 1.0
+            solution = solver.solve(rhs)
+            diag[start:end] = np.asarray(solution)[cols, np.arange(len(cols), dtype=int)]
+        return diag
+
+    if solve_workers > 1:
+        chunks = [chunk for chunk in np.array_split(indices, solve_workers) if len(chunk) > 0]
+        with ThreadPoolExecutor(max_workers=solve_workers) as executor:
+            return np.concatenate(list(executor.map(lambda chunk: inverse_diag_blocks(system, chunk, block_size), chunks)))
+
+    solver = splu(system)
+    diag = np.zeros(len(indices), dtype=np.float64)
+
+    for start in range(0, len(indices), block_size):
+        end = min(start + block_size, len(indices))
+        cols = indices[start:end]
+        rhs = np.zeros((n, len(cols)), dtype=np.float64)
+        rhs[cols, np.arange(len(cols), dtype=int)] = 1.0
+        solution = solver.solve(rhs)
+        diag[start:end] = np.asarray(solution)[cols, np.arange(len(cols), dtype=int)]
+
+    return diag
+
+
+def residual_coefficient_intervals(
+    point_estimates,
+    model,
+    sparse,
+    target,
+    sample_weight,
+    shot,
+    optimal,
+    system=None,
+    solver=None,
+    solve_workers=1
+):
+    point_estimates = np.asarray(point_estimates, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    rows, columns = sparse.shape
+    dof = max(rows - columns - 1, 1)
+
+    if shot:
+        prediction = model.predict_proba(sparse)[:, 1]
+        residuals = target - prediction
+        squared_error_sum = float(np.sum(residuals ** 2))
+        hessian_weights = prediction * (1.0 - prediction)
+        penalty = 1.0 / optimal
+        if system is None:
+            system = penalized_system(sparse, hessian_weights, penalty)
+        if solver is None:
+            solver = splu(system)
+    else:
+        prediction = model.predict(sparse)
+        residuals = target - prediction
+        if sample_weight is None:
+            squared_error_sum = float(np.sum(residuals ** 2))
+            weights = np.ones(rows, dtype=np.float64)
+        else:
+            weights = np.asarray(sample_weight, dtype=np.float64)
+            squared_error_sum = float(np.sum(weights * residuals ** 2))
+        if system is None:
+            system = penalized_system(sparse, weights, optimal)
+        if solver is None:
+            solver = splu(system)
+
+    diag_values = np.maximum(inverse_diag(system, solver=solver, solve_workers=solve_workers), 0.0)
+    standard_errors = np.sqrt((squared_error_sum / dof) * diag_values)
+    margin_of_errors = 1.96 * standard_errors
+    p_values = np.asarray(coefficient_p_values(point_estimates, standard_errors), dtype=np.float64)
+    ci_lower = point_estimates - margin_of_errors
+    ci_upper = point_estimates + margin_of_errors
+
+    return standard_errors, margin_of_errors, p_values, ci_lower, ci_upper
+
+
+def model_fit_metrics(model, sparse, target, sample_weight, shot, regularization):
+    target = np.asarray(target, dtype=np.float64)
+    weights = np.ones(len(target), dtype=np.float64) if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
+    prediction = model.predict_proba(sparse)[:, 1] if shot else model.predict(sparse)
+    prediction = np.asarray(prediction, dtype=np.float64)
+    residuals = target - prediction
+    weight_sum = float(np.sum(weights))
+    target_mean = float(np.average(target, weights=weights)) if weight_sum > 0 else np.nan
+    prediction_mean = float(np.average(prediction, weights=weights)) if weight_sum > 0 else np.nan
+    sse = float(np.sum(weights * residuals ** 2))
+    baseline_sse = float(np.sum(weights * (target - target_mean) ** 2)) if np.isfinite(target_mean) else np.nan
+    mse = sse / weight_sum if weight_sum > 0 else np.nan
+    mae = float(np.sum(weights * np.abs(residuals)) / weight_sum) if weight_sum > 0 else np.nan
+    r2 = 1.0 - (sse / baseline_sse) if baseline_sse and baseline_sse > 0 else np.nan
+
+    metrics = {
+        "model_n_obs": int(len(target)),
+        "model_n_predictors": int(sparse.shape[1]),
+        "model_regularization": float(regularization),
+        "model_weight_sum": weight_sum,
+        "model_target_mean": target_mean,
+        "model_prediction_mean": prediction_mean,
+        "model_sse": sse,
+        "model_mse": mse,
+        "model_rmse": float(np.sqrt(mse)) if np.isfinite(mse) else np.nan,
+        "model_mae": mae,
+        "model_r2": float(r2) if np.isfinite(r2) else np.nan,
+    }
+
+    if shot:
+        clipped = np.clip(prediction, 1e-15, 1.0 - 1e-15)
+        metrics.update({
+            "model_log_loss": float(-np.mean(target * np.log(clipped) + (1.0 - target) * np.log(1.0 - clipped))),
+            "model_brier_score": float(np.mean((target - prediction) ** 2)),
+            "model_accuracy": float(np.mean((prediction >= 0.5) == target)),
+        })
+
+    return metrics
+
+
+def scale_shot_columns(frame, scale):
+    scaled = frame.copy()
+    for col in scaled.columns:
+        if not str(col).startswith('rapm_') or str(col).endswith('_p_value'):
+            continue
+        scaled[col] = scaled[col] * scale
+    return scaled
 
 ### RAPM FUNCTIONS ###
 # Provided in this file are functions vital to the Regularized Adjusted Plus-Minus model in the WSBA Hockey package #
@@ -303,7 +716,7 @@ def label_shifts(pbp):
 
     # Create lineup key
     lineup_arr = pbp[home_cols + away_cols].astype(int).astype(str).to_numpy()
-    lineup_key = np.char.add.reduce(lineup_arr, axis=1)
+    lineup_key = np.array(['|'.join(row) for row in lineup_arr], dtype=object)
     
     # Pre-change detection
     non_change_mask = pbp['event_type'] != 'change'
@@ -411,9 +824,9 @@ def orient_perspective(df, strengths, home=True):
 
     df['is_home'] = int(home)
 
-    cols = shift_cols(df['period'].max())
+    cols = shift_cols()
 
-    return df[cols+strength_cols]
+    return df[cols + strength_cols]
 
 def encode_players(df):
     print('Encoding on-ice players to columns...')
@@ -428,51 +841,16 @@ def encode_players(df):
     offense_team_arr = df['offense_team_abbr'].astype(str).values
     defense_team_arr = df['defense_team_abbr'].astype(str).values
 
-    offense_coach_arr = df['offense_coach'].astype(str).values
-    defense_coach_arr = df['defense_coach'].astype(str).values
-
-    #Generate player groupings
-    n_rows = len(df)
-    offense_lists = [None] * n_rows
-    defense_lists = [None] * n_rows
-
-    offense_coach_lists = [None] * n_rows
-    defense_coach_lists = [None] * n_rows
-    
-    for i in range(n_rows):
-        offense_lists[i] = [
-            f"{int(pid)}_{season_arr[i]}_{offense_team_arr[i]}"
-            for pid in offense_arr[i] if pid != 0
-        ]
-        defense_lists[i] = [
-            f"{int(pid)}_{season_arr[i]}_{defense_team_arr[i]}"
-            for pid in defense_arr[i] if pid != 0
-        ]
-
-        offense_coach_lists[i] = [f"{offense_coach_arr[i]}_{season_arr[i]}_{offense_team_arr[i]}"]
-        defense_coach_lists[i] = [f"{defense_coach_arr[i]}_{season_arr[i]}_{defense_team_arr[i]}"]
-        for state in ['lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']:
-            if df[state].iloc[i] == 1:
-                offense_coach_lists[i].append(f"{state}_{offense_coach_arr[i]}_{season_arr[i]}_{offense_team_arr[i]}")
-                defense_coach_lists[i].append(f"{state}_{defense_coach_arr[i]}_{season_arr[i]}_{defense_team_arr[i]}")
-    
-    #Encode to sparse matrices
-    mlb_offense = MultiLabelBinarizer(sparse_output=True)
-    mlb_defense = MultiLabelBinarizer(sparse_output=True)
-
-    mlb_offense_coach = MultiLabelBinarizer(sparse_output=True)
-    mlb_defense_coach = MultiLabelBinarizer(sparse_output=True)
-    
-    offense_sparse = mlb_offense.fit_transform(offense_lists)
-    defense_sparse = mlb_defense.fit_transform(defense_lists)
-
-    offense_coach_sparse = mlb_offense_coach.fit_transform(offense_coach_lists)
-    defense_coach_sparse = mlb_defense_coach.fit_transform(defense_coach_lists)
+    offense_sparse, offense_classes = indicator_sparse(offense_arr, season_arr, offense_team_arr)
+    defense_sparse, defense_classes = indicator_sparse(defense_arr, season_arr, defense_team_arr)
+    offense_coach_sparse, offense_coach_classes = coach_sparse(df['offense_coach'].astype(str).to_numpy(), season_arr, offense_team_arr, df)
+    defense_coach_sparse, defense_coach_classes = coach_sparse(df['defense_coach'].astype(str).to_numpy(), season_arr, defense_team_arr, df)
     
     #Trim input dataframe to sparse and combine with encoding sparse
     excluded_cols = (
         offense_cols + defense_cols + 
         ['season', 'game_id', 'shift_id', 'score_state','zone_code',
+        'tied',
         'offense_goalie_id', 'defense_goalie_id',
         'offense_coach', 'defense_coach',
         'offense_team_abbr', 'defense_team_abbr'] +
@@ -481,9 +859,7 @@ def encode_players(df):
         
     feature_cols = [col for col in df.columns if col not in excluded_cols]
     
-    # Convert features to sparse matrix
-    features_dense = df[feature_cols].fillna(0).values
-    features_sparse = sp.csr_matrix(features_dense)
+    features_sparse = columns_to_csr(df, feature_cols)
 
     X_sparse = sp.hstack([
         features_sparse,
@@ -493,10 +869,10 @@ def encode_players(df):
         defense_coach_sparse
     ], format='csr')
 
-    offense_cols_encoded = [f'offense_{col}' for col in mlb_offense.classes_]
-    defense_cols_encoded = [f'defense_{col}' for col in mlb_defense.classes_]
-    offense_coach_cols_encoded = [f'offense_coach_{col}' for col in mlb_offense_coach.classes_]
-    defense_coach_cols_encoded = [f'defense_coach_{col}' for col in mlb_defense_coach.classes_]
+    offense_cols_encoded = [f'offense_{col}' for col in offense_classes]
+    defense_cols_encoded = [f'defense_{col}' for col in defense_classes]
+    offense_coach_cols_encoded = [f'offense_coach_{col}' for col in offense_coach_classes]
+    defense_coach_cols_encoded = [f'defense_coach_{col}' for col in defense_coach_classes]
 
     features = (
         feature_cols +
@@ -510,10 +886,10 @@ def encode_players(df):
     return {
         'predictors': X_sparse,
         'features': features,
-        'offense_classes': mlb_offense.classes_,
-        'defense_classes': mlb_defense.classes_,
-        'offense_coach_classes': mlb_offense_coach.classes_,
-        'defense_coach_classes': mlb_defense_coach.classes_
+        'offense_classes': offense_classes,
+        'defense_classes': defense_classes,
+        'offense_coach_classes': offense_coach_classes,
+        'defense_coach_classes': defense_coach_classes
     }
 
 def encode_shooters(df):
@@ -534,88 +910,35 @@ def encode_shooters(df):
     shooter_team_arr = df['shooter_team_abbr'].astype(str).values
     goalie_team_arr = df['goalie_team_abbr'].astype(str).values
 
-    # Collect all unique players for each role
-    shooter_set = set()
-    goalie_set = set()
-    primary_passer_set = set()
-    secondary_passer_set = set()
-    
     n_rows = len(df)
-    
-    for i in range(n_rows):
-        # Shooter
-        if shooter_arr[i] != 0:
-            shooter_set.add(f"{int(shooter_arr[i])}_{season_arr[i]}_{shooter_team_arr[i]}")
-        
-        # Goalie
-        if goalie_arr[i] != 0:
-            goalie_set.add(f"{int(goalie_arr[i])}_{season_arr[i]}_{goalie_team_arr[i]}")
-        
-        # Primary passers
-        for j, pid in enumerate(passer_arr[i]):
-            if pid != 0 and primary_passer_prob_arr[i][j] > 0:
-                primary_passer_set.add(f"{int(pid)}_{season_arr[i]}_{shooter_team_arr[i]}")
-        
-        # Secondary passers
-        for j, pid in enumerate(passer_arr[i]):
-            if pid != 0 and secondary_passer_prob_arr[i][j] > 0:
-                secondary_passer_set.add(f"{int(pid)}_{season_arr[i]}_{shooter_team_arr[i]}")
-    
-    # Create sorted lists of classes
-    shooter_classes = sorted(list(shooter_set))
-    goalie_classes = sorted(list(goalie_set))
-    primary_passer_classes = sorted(list(primary_passer_set))
-    secondary_passer_classes = sorted(list(secondary_passer_set))
-    
-    # Create column index mappings
-    shooter_col_map = {player: idx for idx, player in enumerate(shooter_classes)}
-    goalie_col_map = {player: idx for idx, player in enumerate(goalie_classes)}
-    primary_passer_col_map = {player: idx for idx, player in enumerate(primary_passer_classes)}
-    secondary_passer_col_map = {player: idx for idx, player in enumerate(secondary_passer_classes)}
-    
-    # Build sparse matrices manually
-    from scipy.sparse import lil_matrix
-    
-    shooter_sparse = lil_matrix((n_rows, len(shooter_classes)))
-    goalie_sparse = lil_matrix((n_rows, len(goalie_classes)))
-    primary_passer_sparse = lil_matrix((n_rows, len(primary_passer_classes)))
-    secondary_passer_sparse = lil_matrix((n_rows, len(secondary_passer_classes)))
-    
-    for i in range(n_rows):
-        # Shooter (single player, shooter team)
-        if shooter_arr[i] != 0:
-            player_label = f"{int(shooter_arr[i])}_{season_arr[i]}_{shooter_team_arr[i]}"
-            shooter_sparse[i, shooter_col_map[player_label]] = 1
-        
-        # Goalie (single player, goalie team)
-        if goalie_arr[i] != 0:
-            player_label = f"{int(goalie_arr[i])}_{season_arr[i]}_{goalie_team_arr[i]}"
-            goalie_sparse[i, goalie_col_map[player_label]] = 1
-        
-        # Primary passers with probabilities
-        for j, pid in enumerate(passer_arr[i]):
-            if pid != 0 and primary_passer_prob_arr[i][j] > 0:
-                player_label = f"{int(pid)}_{season_arr[i]}_{shooter_team_arr[i]}"
-                primary_passer_sparse[i, primary_passer_col_map[player_label]] = primary_passer_prob_arr[i][j]
-        
-        # Secondary passers with probabilities
-        for j, pid in enumerate(passer_arr[i]):
-            if pid != 0 and secondary_passer_prob_arr[i][j] > 0:
-                player_label = f"{int(pid)}_{season_arr[i]}_{shooter_team_arr[i]}"
-                secondary_passer_sparse[i, secondary_passer_col_map[player_label]] = secondary_passer_prob_arr[i][j]
-    
-    # Convert to csr format for efficient operations
-    shooter_sparse = shooter_sparse.tocsr()
-    goalie_sparse = goalie_sparse.tocsr()
-    primary_passer_sparse = primary_passer_sparse.tocsr()
-    secondary_passer_sparse = secondary_passer_sparse.tocsr()
+
+    def build_weighted_passer_sparse(prob_arr):
+        prob_arr = np.asarray(prob_arr, dtype=np.float64)
+        flat_ids = passer_arr.reshape(-1)
+        flat_weights = prob_arr.reshape(-1)
+        valid = (flat_ids != 0) & (flat_weights > 0)
+        if not np.any(valid):
+            return sp.csr_matrix((n_rows, 0), dtype=np.float64), np.array([], dtype=object)
+
+        n_slots = passer_arr.shape[1]
+        row_idx = np.repeat(np.arange(n_rows, dtype=np.int32), n_slots)[valid]
+        season_idx = np.repeat(season_arr, n_slots)[valid]
+        team_idx = np.repeat(shooter_team_arr, n_slots)[valid]
+        labels = entity_labels(flat_ids[valid], season_idx, team_idx)
+        col_idx, classes = pd.factorize(labels, sort=True)
+        sparse = sp.csr_matrix((flat_weights[valid], (row_idx, col_idx)), shape=(n_rows, len(classes)), dtype=np.float64)
+        sparse.sum_duplicates()
+        return sparse, np.asarray(classes, dtype=object)
+
+    shooter_sparse, shooter_classes = indicator_sparse(shooter_arr.reshape(-1, 1), season_arr, shooter_team_arr)
+    goalie_sparse, goalie_classes = indicator_sparse(goalie_arr.reshape(-1, 1), season_arr, goalie_team_arr)
+    primary_passer_sparse, primary_passer_classes = build_weighted_passer_sparse(primary_passer_prob_arr)
+    secondary_passer_sparse, secondary_passer_classes = build_weighted_passer_sparse(secondary_passer_prob_arr)
     
     # Trim input dataframe to sparse and combine with encoding sparse
     feature_cols = ['expected_goals']
     
-    # Convert features to sparse matrix
-    features_dense = df[feature_cols].fillna(0).values
-    features_sparse = sp.csr_matrix(features_dense)
+    features_sparse = columns_to_csr(df, feature_cols)
 
     X_sparse = sp.hstack([features_sparse, shooter_sparse, goalie_sparse, 
                           primary_passer_sparse, secondary_passer_sparse], format='csr')
@@ -664,6 +987,10 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
             pbp['away_team_abbr'],
             pbp['home_team_abbr']
         )
+        if 'is_home' not in pbp.columns:
+            pbp['is_home'] = pbp['event_team_abbr'].eq(pbp['home_team_abbr'])
+        if 'is_goal' not in pbp.columns:
+            pbp['is_goal'] = pbp['event_type'].eq('goal').astype(int)
 
         #Collect and assign event passers
         home_cols = [f'home_on_{i}_id' for i in range(1,7)]
@@ -672,8 +999,21 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
         away_primary_probs = [f'away_on_{i}_primary_fenwick_assist_probability' for i in range(1,7)]
         home_secondary_probs = [f'home_on_{i}_secondary_fenwick_assist_probability' for i in range(1,7)]
         away_secondary_probs = [f'away_on_{i}_secondary_fenwick_assist_probability' for i in range(1,7)]
+        passer_probability_cols = home_primary_probs + away_primary_probs + home_secondary_probs + away_secondary_probs
+        missing_probability_cols = [col for col in passer_probability_cols if col not in pbp.columns]
+        if missing_probability_cols:
+            position_cols = [f'{venue}_on_{i}_pos' for venue in ['home', 'away'] for i in range(1, 7)]
+            required_cols = position_cols + ['event_player_2_id', 'event_player_3_id']
+            missing_required_cols = [col for col in required_cols if col not in pbp.columns]
+            if missing_required_cols:
+                raise KeyError(
+                    "Shot RAPM requires passer assist probabilities or the columns needed to impute them. "
+                    f"Missing columns: {missing_required_cols}"
+                )
+            from wsba_ml.xg_model import apply_passing_imputation
+            pbp = apply_passing_imputation(pbp)
 
-        pbp[home_cols+away_cols+home_primary_probs+away_primary_probs+home_secondary_probs+away_secondary_probs] = pbp[home_cols+away_cols+home_primary_probs+away_primary_probs+home_secondary_probs+away_secondary_probs].fillna(0)
+        pbp[home_cols + away_cols + passer_probability_cols] = pbp[home_cols + away_cols + passer_probability_cols].fillna(0)
 
         for i in range(6):
             pbp[f'passer_{i+1}_id'] = np.where(
@@ -707,10 +1047,10 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
         )
 
         # Trim dataframe to only the columns needed for shot RAPM
+        feature_cols = [col for col in wsba.CONTINUOUS + wsba.BOOLEAN if col in pbp.columns]
         pbp = pbp[
-            wsba.CONTINUOUS
-            + wsba.BOOLEAN
-            + [ 
+            feature_cols
+            + [
                 'season',
                 'shooter_id',
                 'goalie_id',
@@ -831,18 +1171,13 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
             for strength in strengths:
                 pbp[f'{venue}_strength_{strength}'] = ((pbp['strength_state_venue'].str[::-1] if venue == 'home' else pbp['strength_state_venue'])==strength).astype(int)
 
-        #Period indicators
-        period_max = pbp['period'].max() + 1
-        for i in range(1, period_max):
-            pbp[f'period_{i}'] = (pbp['period'] == i).astype(int)
+        pbp['period_2'] = (pbp['period'] == 2).astype(int)
+        pbp['period_3'] = (pbp['period'] == 3).astype(int)
+        pbp['period_4_plus'] = (pbp['period'] >= 4).astype(int)
 
         #Move down to provided strength states for both teams
-        pbp = pbp.loc[
-            np.logical_or.reduce(
-                [pbp[f'home_strength_{s}'] == 1 for s in strengths] +
-                [pbp[f'away_strength_{s}'] == 1 for s in strengths]
-            )
-        ]
+        strength_mask_cols = [f'home_strength_{s}' for s in strengths] + [f'away_strength_{s}' for s in strengths]
+        pbp = pbp.loc[pbp[strength_mask_cols].eq(1).any(axis=1)]
 
         if include_maps:
             map_events = pbp.loc[
@@ -872,6 +1207,9 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
                 'away_lead_3_plus': 'max',
                 'tied': 'max',
                 'scoreless': 'max',
+                'period_2': 'max',
+                'period_3': 'max',
+                'period_4_plus': 'max',
                 'home_power_play_expiry': 'max',
                 'away_power_play_expiry': 'max',
                 'home_last_penalty': 'max',
@@ -879,7 +1217,6 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
                 
 
                 **{f'{v}_{s}': 'sum' for v in ['home', 'away'] for s in RAPM_STATS},
-
                 **{
                     col: 'first' for col in (
                     player_cols + [
@@ -897,9 +1234,8 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
                     ]
                 )}
 
-            } | 
-            {f'{v}_strength_{s}': 'max' for v in ['home', 'away'] for s in strengths} | 
-            {f'period_{i}': 'max' for i in range(1, period_max)}
+            } |
+            {f'{v}_strength_{s}': 'max' for v in ['home', 'away'] for s in strengths}
         ).reset_index().rename(columns={'event_length': 'shift_length'})
 
         shifts = shifts.loc[shifts['shift_length'] > 0].copy()
@@ -920,19 +1256,16 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
         combined_shifts = pd.concat([home_offense, away_offense], ignore_index=True)
 
         #Since the target variable is offensive trim dataframe down to strength states provided for the offensive team
-        sbs = combined_shifts.loc[
-            np.logical_or.reduce(
-                [combined_shifts[f'strength_{s}'] == 1 for s in strengths]
-            )
-        ]
+        strength_mask_cols = [f'strength_{s}' for s in strengths]
+        sbs = combined_shifts.loc[combined_shifts[strength_mask_cols].eq(1).any(axis=1)]
 
         #Choose a single reference level among the provided non-empty-net strengths.
-        drop_strength = _reference_strength(strengths)
+        drop_strength = reference_strength(strengths)
 
         #Drop reference level columns
         sbs = sbs.drop(
             columns=(
-                ['on_the_fly', 'tied', 'period_1']
+                ['on_the_fly']
                 + ([f'strength_{drop_strength}'] if drop_strength else [])
             ), errors='ignore'
         )
@@ -1115,7 +1448,7 @@ def calc_info(sbs, strengths, shot=False):
         )
     else:
         strength_state = classify_strength_state(strengths)
-        score_states = ['lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
+        score_states = ['tied', 'lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
 
         offense_cols = [f"offense_on_{i}_id" for i in range(1, 7)]
         defense_cols = [f"defense_on_{i}_id" for i in range(1, 7)]
@@ -1222,6 +1555,31 @@ def calc_info(sbs, strengths, shot=False):
             agg["time_on_ice"] = agg["time_on_ice"] / 60
             return agg
 
+        def aggregate_coach_state_toi(df, strength_state):
+            value_cols = [f"{state}_time_on_ice" for state in score_states]
+            work = df[["coach_name", "season", "team_abbr", "side", "strength_state", "time_on_ice"] + score_states].copy()
+            for state in score_states:
+                work[f"{state}_time_on_ice"] = work["time_on_ice"] * work[state]
+
+            if strength_state in ("even_strength", "all"):
+                agg = work.groupby(
+                    ["coach_name", "season", "team_abbr", "strength_state"], as_index=False
+                )[value_cols].sum()
+            else:
+                agg = work.groupby(
+                    ["coach_name", "season", "team_abbr", "side", "strength_state"], as_index=False
+                )[value_cols].sum()
+
+                if strength_state == "power_play":
+                    agg["strength_state"] = agg["side"].map({"offense": "power_play", "defense": "penalty_kill"})
+                elif strength_state == "penalty_kill":
+                    agg["strength_state"] = agg["side"].map({"offense": "penalty_kill", "defense": "power_play"})
+
+                agg = agg.drop(columns="side")
+
+            agg[value_cols] = agg[value_cols] / 60
+            return agg
+
         agg = aggregate_toi(long, "player_id", strength_state)
         agg = agg.merge(gp, on="player_id", how="left")
         agg['season_type'] = 2
@@ -1229,29 +1587,43 @@ def calc_info(sbs, strengths, shot=False):
         agg_coach = aggregate_toi(long_coach, "coach_name", strength_state)
         agg_coach = agg_coach.merge(gp_coach, on="coach_name", how="left")
         agg_coach['season_type'] = 2
-        for state in score_states:
-            state_coach = long_coach.loc[long_coach[state] == 1].copy()
-            state_agg = aggregate_toi(state_coach, "coach_name", strength_state).rename(
-                columns={"time_on_ice": f"{state}_time_on_ice"}
-            )
-            agg_coach = agg_coach.merge(
-                state_agg[["coach_name", "season", "team_abbr", "strength_state", f"{state}_time_on_ice"]],
-                on=["coach_name", "season", "team_abbr", "strength_state"],
-                how="left"
-            )
-            agg_coach[f"{state}_time_on_ice"] = agg_coach[f"{state}_time_on_ice"].fillna(0)
+        state_agg = aggregate_coach_state_toi(long_coach, strength_state)
+        agg_coach = agg_coach.merge(
+            state_agg,
+            on=["coach_name", "season", "team_abbr", "strength_state"],
+            how="left"
+        )
+        state_toi_cols = [f"{state}_time_on_ice" for state in score_states]
+        agg_coach[state_toi_cols] = agg_coach[state_toi_cols].fillna(0)
 
         return (
             agg[["player_id", "season", "team_abbr", "games_played", "time_on_ice", "strength_state", "season_type"]],
-            agg_coach[["coach_name", "season", "team_abbr", "games_played", "time_on_ice", "strength_state", "season_type"] + [f"{state}_time_on_ice" for state in score_states]]
+            agg_coach[["coach_name", "season", "team_abbr", "games_played", "time_on_ice", "strength_state", "season_type"] + state_toi_cols]
         )
 
 
-def _model_path_accepts_csv(model_path):
-    return str(model_path).lower().endswith(".csv")
+def model_table_format(model_path):
+    suffix = Path(str(model_path)).suffix.lower()
+    if suffix in {".csv", ".parquet"}:
+        return suffix[1:]
+    return None
 
 
-def _season_value_from_frame(frame):
+def read_model_table(model_path):
+    if model_table_format(model_path) == "parquet":
+        return pd.read_parquet(model_path)
+    return pd.read_csv(model_path)
+
+
+def write_model_table(frame, model_path):
+    Path(model_path).parent.mkdir(parents=True, exist_ok=True)
+    if model_table_format(model_path) == "parquet":
+        frame.to_parquet(model_path, index=False)
+    else:
+        frame.to_csv(model_path, index=False)
+
+
+def frame_season(frame):
     if "season" not in frame.columns:
         return None
 
@@ -1263,33 +1635,50 @@ def _season_value_from_frame(frame):
     return ", ".join(str(season) for season in seasons)
 
 
-def _coef_row_from_saved_model(
+def coef_row(
     *,
     metric,
     strength_state,
     season_value,
     scalar_predictors,
     scalar_values,
+    scalar_standard_errors=None,
+    scalar_margin_of_errors=None,
+    scalar_p_values=None,
+    scalar_ci_lower=None,
+    scalar_ci_upper=None,
     map_predictors=None,
     map_values=None,
+    model_metrics=None,
 ):
     row = {
         "metric": metric,
         "strength_state": strength_state,
         "season": season_value,
     }
+    if model_metrics:
+        row.update(model_metrics)
+    map_lookup = dict(zip(map_predictors or [], map_values or []))
 
-    for predictor, value in zip(scalar_predictors, scalar_values):
-        row[predictor] = value
-
-    if map_predictors and map_values:
-        for predictor, value in zip(map_predictors, map_values):
-            row[f"{predictor}_map"] = value
+    for i, predictor in enumerate(scalar_predictors):
+        row[predictor] = scalar_values[i]
+        if predictor in map_lookup:
+            row[f"{predictor}_map"] = map_lookup[predictor]
+        if scalar_standard_errors is not None:
+            row[f"{predictor}_standard_error"] = scalar_standard_errors[i]
+        if scalar_margin_of_errors is not None:
+            row[f"{predictor}_margin_of_error"] = scalar_margin_of_errors[i]
+        if scalar_p_values is not None:
+            row[f"{predictor}_p_value"] = scalar_p_values[i]
+        if scalar_ci_lower is not None:
+            row[f"{predictor}_ci_lower"] = scalar_ci_lower[i]
+        if scalar_ci_upper is not None:
+            row[f"{predictor}_ci_upper"] = scalar_ci_upper[i]
 
     return row
 
 
-def _merge_model_rows(existing_df, new_df):
+def merge_model_rows(existing_df, new_df):
     if existing_df is None or existing_df.empty:
         return new_df.copy()
     if new_df.empty:
@@ -1300,53 +1689,55 @@ def _merge_model_rows(existing_df, new_df):
     existing_aligned = existing_df.reindex(columns=all_columns)
     new_aligned = new_df.reindex(columns=all_columns)
 
-    merged_rows = []
-    matched_existing = pd.Series(False, index=existing_aligned.index)
-
+    keep_existing = pd.Series(True, index=existing_aligned.index)
     for _, new_row in new_aligned.iterrows():
         mask = pd.Series(True, index=existing_aligned.index)
         for key in key_cols:
             mask &= existing_aligned[key].astype(str).eq(str(new_row[key]))
+        keep_existing &= ~mask
 
-        if mask.any():
-            existing_row = existing_aligned.loc[mask].iloc[-1].copy()
-            matched_existing.loc[mask] = True
-            for column in all_columns:
-                if column in key_cols:
-                    existing_row[column] = new_row[column]
-                elif column in new_aligned.columns and pd.notna(new_row[column]):
-                    existing_row[column] = new_row[column]
-            merged_rows.append(existing_row)
-        else:
-            merged_rows.append(new_row.copy())
+    return pd.concat([existing_aligned.loc[keep_existing], new_aligned], ignore_index=True)
 
-    preserved_existing = existing_aligned.loc[~matched_existing].copy()
-    merged_df = pd.DataFrame(merged_rows, columns=all_columns)
-    combined = pd.concat([preserved_existing, merged_df], ignore_index=True)
-    return combined
+
+def target_map_flags(targets, maps):
+    targets = list(targets)
+    if isinstance(maps, (bool, np.bool_)):
+        return dict.fromkeys(targets, bool(maps))
+
+    flags = list(maps)
+    if len(flags) != len(targets):
+        raise ValueError("When maps is a list, it must have the same length as targets.")
+    return dict(zip(targets, [bool(flag) for flag in flags]))
 
 def wsba_rapm(
     pbp, 
     strengths, 
-    targets=['expected_goals'], 
+    targets=None,
     shot=False, 
-    model_path='wsba_reg.csv', 
+    model_path='wsba_reg.parquet',
     feature_filters=None,
-    scalars_only=False,
-    params={
-        'expected_goals': {
-            'param_grid': {'alpha': np.logspace(-4, 4, 50)},
-            'cv': 10,
-            'n_jobs': 4
-        }
-    }
+    params=None,
+    uncertainty=True,
+    maps=True,
+    solve_workers=1
 ):
     #Train and calculate the WSBA RAPM model
+    if targets is None:
+        targets = ['expected_goals']
+    if params is None:
+        params = {
+            'expected_goals': {
+                'alpha': 50000
+            }
+        }
 
     #Retrieve shift by shift dataframe
-    prepared = prepare_rapm_data(pbp, strengths, shot=shot, include_maps=not scalars_only)
+    map_flags = target_map_flags(targets, maps)
+    include_maps = (not shot) and any(map_flags.get(target, False) and target in MAP_TARGETS for target in targets)
+    prepared = prepare_rapm_data(pbp, strengths, shot=shot, include_maps=include_maps)
     sbs = prepared if shot else prepared['sbs']
     shift_maps = None if shot else prepared['shift_maps']
+    derived_strength_state = classify_strength_state(strengths)
     
     #Prepare final time_on_ice dataframe
     toi_df, second_df = calc_info(sbs, strengths, shot)
@@ -1355,12 +1746,11 @@ def wsba_rapm(
     data = encode_shooters(sbs) if shot else encode_players(sbs)
     predictor_names = data['features']
     sparse = data['predictors']
-    model_path_is_csv = _model_path_accepts_csv(model_path)
-    season_value = _season_value_from_frame(sbs)
-    derived_strength_state = classify_strength_state(strengths)
+    model_path_is_table = model_table_format(model_path) is not None
+    season_value = frame_season(sbs)
 
     #Load in existing model data (if it exists)
-    if model_path_is_csv:
+    if model_path_is_table:
         model_data = {}
     else:
         try:
@@ -1372,9 +1762,16 @@ def wsba_rapm(
             model_data = {}
 
     model_type = 'shot' if shot else 'shift'
+    resolved_feature_filters = feature_filters or (DEFAULT_FEATURES['shots'] if shot else DEFAULT_FEATURES['shifts'])
+    target_views = {
+        target: select_target_predictors(sparse, predictor_names, target, feature_filters=resolved_feature_filters)
+        for target in targets
+    }
 
     if model_type not in model_data:
         model_data[model_type] = {}
+
+    system_component_cache = {}
 
     #At provided strengths, run the model for each provided target
     rapm_dfs = []
@@ -1383,18 +1780,22 @@ def wsba_rapm(
     model_rows = []
     for target in targets:
         # Select predictors based on current target
-        use_shift_map = (not scalars_only) and (not shot) and (target in MAP_TARGETS)
+        use_shift_map = (not shot) and map_flags.get(target, False) and (target in MAP_TARGETS)
         weight = None if shot else sbs['shift_length'].values
         live_coef_frame = None
         target_params = params[target]
-        if not feature_filters:
-            feature_filters = DEFAULT_FEATURES['shifts'] if not shot else DEFAULT_FEATURES['shots']
-        target_view = select_target_predictors(sparse, predictor_names, target, feature_filters=feature_filters)
+        target_solve_workers = normalize_workers(target_params.get('solve_workers', solve_workers))
+        target_view = target_views[target]
         target_sparse = target_view['predictors']
         target_predictor_names = target_view['features']
         target_entity_mask = target_view['entity_mask']
         target_context_mask = target_view['context_mask']
-
+        system_components = None
+        if not shot:
+            system_key = tuple(target_predictor_names)
+            if system_key not in system_component_cache:
+                system_component_cache[system_key] = normal_components(target_sparse, sbs['shift_length'].values)
+            system_components = system_component_cache[system_key]
         if len(target_predictor_names) != len(predictor_names):
             print(f'Using {len(target_predictor_names)} / {len(predictor_names)} encoded predictors for {target}')
 
@@ -1403,74 +1804,27 @@ def wsba_rapm(
         else:
             target_series = sbs[f'{target}_for_per_sixty'].values
 
-        # If no alpha is provided then it must be derived
-        if 'alpha' in target_params.keys() or 'C' in target_params.keys():
-            optimal = model_data[model_type]['optimal_C'] = target_params['C'] if shot else target_params['alpha']
-        else:
-            # Choose model type
-            if shot:
-                base_model = LogisticRegression(
-                    penalty='l2',
-                    max_iter=target_params['max_iter'],
-                    fit_intercept=True, 
-                    random_state=42
-                )
-            else:
-                base_model = Ridge(
-                    tol=1e-3,
-                    fit_intercept=True,
-                    random_state=42
-                )
-
-            print('### CROSS VALIDATION ###')
-    
-            model_cv = RandomizedSearchCV(
-                estimator=base_model,
-                param_distributions=target_params['param_grid'],
-                cv=target_params['cv'],
-                n_jobs=target_params['n_jobs']
-            )
-
-            model_cv.fit(target_sparse, target_series, sample_weight=None if shot else weight)
-
-            if shot:
-                optimal = model_data[model_type]['optimal_C'] = model_cv.best_params_['C']
-            else:
-                optimal = model_data[model_type]['optimal_alpha'] = model_cv.best_params_['alpha']
+        regularization_key = 'C' if shot else 'alpha'
+        if regularization_key not in target_params:
+            raise ValueError(f"RAPM target {target!r} requires params[{target!r}]['{regularization_key}'].")
+        optimal = target_params[regularization_key]
+        model_data[model_type][f'optimal_{regularization_key}'] = optimal
 
         print(f'Optimal parameter ({model_type}, {target}): {optimal:.4f}')
         print('### FINAL MODEL ###')
 
         # Final model fit
-        if shot:
-            model = LogisticRegression(C=optimal, penalty='l2', fit_intercept=True, max_iter=target_params['max_iter'], random_state=42)
-        else:
-            model = Ridge(alpha=optimal, tol=1e-3, fit_intercept=True, random_state=42)
-
-        model.fit(target_sparse, target_series, sample_weight=None if shot else weight)
-
-        if shot:
-            intercept = float(model.intercept_[0])
-            coefs = model.coef_.ravel().tolist()
-        else:
-            intercept = float(model.intercept_)
-            coefs = model.coef_.tolist()
-
-        live_scalar_predictors = ['(intercept)'] + target_predictor_names
-        live_scalar_values = [intercept] + coefs
-        saved_predictors = ['(intercept)'] + [name for name, keep in zip(target_predictor_names, target_context_mask) if keep]
-        saved_values = [intercept] + [coef for coef, keep in zip(coefs, target_context_mask) if keep]
-
-        if not model_path_is_csv:
-            model_data[model_type].update({
-                f'{target}_predictors': saved_predictors,
-                target: saved_values
-            })
-
+        shared_system = None
+        shared_solver = None
+        map_groups = None
         saved_map_predictors = []
         saved_map_values = []
 
         if use_shift_map:
+            print(f'Fitting spatial maps ({model_type}, {target})...')
+            shared_system = penalized_system_from_components(*system_components, optimal)
+            if target_solve_workers == 1 or uncertainty:
+                shared_solver = splu(shared_system)
             map_groups = fit_shift_map_model(
                 sparse=target_sparse,
                 weights=weight,
@@ -1480,20 +1834,137 @@ def wsba_rapm(
                 selected_masks={
                     'entity': target_entity_mask,
                     'context': target_context_mask
-                }
+                },
+                system=shared_system,
+                solver=shared_solver if target_solve_workers == 1 else None,
+                solve_workers=target_solve_workers
             )
+            print(f'Finished spatial maps ({model_type}, {target}).')
+
+            intercept_map_predictors, intercept_map_scalar, _ = map_groups['intercept']
+            entity_map_predictors, entity_map_scalar, _ = map_groups['entity']
+            context_map_predictors, context_map_scalar, _ = map_groups['context']
+            scalar_lookup = dict(zip(intercept_map_predictors, intercept_map_scalar))
+            scalar_lookup.update(dict(zip(entity_map_predictors, entity_map_scalar)))
+            scalar_lookup.update(dict(zip(context_map_predictors, context_map_scalar)))
+
+            live_scalar_predictors = ['(intercept)'] + target_predictor_names
+            live_scalar_values = [float(scalar_lookup[name]) for name in live_scalar_predictors]
+            coefficient_vector = np.asarray(live_scalar_values, dtype=np.float64)
+            model = _SparseRidgeModel(coefficient_vector)
+            saved_map_predictors = list(context_map_predictors)
+            saved_map_values = list(map_groups['context'][2])
+        else:
+            print(f'Fitting final {model_type} model ({target})...')
+            if shot:
+                model = shot_estimator(optimal, target_params)
+                model.fit(target_sparse, target_series)
+            else:
+                needs_repeated_solves = bool(uncertainty)
+                model, shared_system, shared_solver = fit_sparse_ridge(
+                    target_sparse,
+                    target_series,
+                    weight,
+                    optimal,
+                    factorize=needs_repeated_solves,
+                    tol=target_params.get('fit_tol', 1e-8),
+                    maxiter=target_params.get('fit_max_iter'),
+                    system_components=system_components
+                )
+            print(f'Finished final {model_type} model ({target}).')
+
+            coefficient_vector = coef_vector(model, shot)
+            live_scalar_predictors = ['(intercept)'] + target_predictor_names
+            live_scalar_values = coefficient_vector.tolist()
+
+        intercept = float(live_scalar_values[0])
+        coefs = list(live_scalar_values[1:])
+
+        fit_metrics = model_fit_metrics(
+            model,
+            target_sparse,
+            target_series,
+            None if shot else weight,
+            shot,
+            optimal
+        )
+
+        coefficient_lookup = dict(zip(live_scalar_predictors, live_scalar_values))
+
+        if uncertainty:
+            standard_errors, margin_of_errors, p_values, ci_lower, ci_upper = residual_coefficient_intervals(
+                coefficient_vector,
+                model,
+                target_sparse,
+                target_series,
+                None if shot else weight,
+                shot,
+                optimal,
+                system=shared_system,
+                solver=shared_solver,
+                solve_workers=target_solve_workers
+            )
+        else:
+            standard_errors = np.full_like(coefficient_vector, np.nan, dtype=np.float64)
+            margin_of_errors = np.full_like(coefficient_vector, np.nan, dtype=np.float64)
+            p_values = np.full_like(coefficient_vector, np.nan, dtype=np.float64)
+            ci_lower = np.full_like(coefficient_vector, np.nan, dtype=np.float64)
+            ci_upper = np.full_like(coefficient_vector, np.nan, dtype=np.float64)
+        live_standard_errors = standard_errors.tolist()
+        live_margin_of_errors = margin_of_errors.tolist()
+        live_p_values = p_values.tolist()
+        live_ci_lower = ci_lower.tolist()
+        live_ci_upper = ci_upper.tolist()
+        saved_predictors = ['(intercept)'] + [name for name, keep in zip(target_predictor_names, target_context_mask) if keep]
+        saved_values = [intercept] + [coef for coef, keep in zip(coefs, target_context_mask) if keep]
+        saved_standard_errors = [live_standard_errors[0]] + [se for se, keep in zip(live_standard_errors[1:], target_context_mask) if keep]
+        saved_margin_of_errors = [live_margin_of_errors[0]] + [moe for moe, keep in zip(live_margin_of_errors[1:], target_context_mask) if keep]
+        saved_p_values = [live_p_values[0]] + [p for p, keep in zip(live_p_values[1:], target_context_mask) if keep]
+        saved_ci_lower = [live_ci_lower[0]] + [ci for ci, keep in zip(live_ci_lower[1:], target_context_mask) if keep]
+        saved_ci_upper = [live_ci_upper[0]] + [ci for ci, keep in zip(live_ci_upper[1:], target_context_mask) if keep]
+
+        if not model_path_is_table:
+            model_data[model_type].update({
+                f'{target}_predictors': saved_predictors,
+                target: saved_values,
+                f'{target}_standard_error': saved_standard_errors,
+                f'{target}_margin_of_error': saved_margin_of_errors,
+                f'{target}_p_value': saved_p_values,
+                f'{target}_ci_lower': saved_ci_lower,
+                f'{target}_ci_upper': saved_ci_upper,
+                f'{target}_all_predictors': live_scalar_predictors,
+                f'{target}_all': live_scalar_values,
+                f'{target}_all_standard_error': live_standard_errors,
+                f'{target}_all_margin_of_error': live_margin_of_errors,
+                f'{target}_all_p_value': live_p_values,
+                f'{target}_all_ci_lower': live_ci_lower,
+                f'{target}_all_ci_upper': live_ci_upper,
+                f'{target}_model_metrics': fit_metrics
+            })
+
+        if use_shift_map:
             entity_map_predictors, entity_map_scalar, entity_map_values = map_groups['entity']
             context_map_predictors, context_map_scalar, context_map_values = map_groups['context']
-            saved_map_predictors = list(context_map_predictors)
-            saved_map_values = list(context_map_values)
 
             live_coef_frame = pd.DataFrame({
                 'player_id': entity_map_predictors,
                 target: entity_map_scalar,
                 f'{target}_map': entity_map_values
             })
+            live_coef_frame = live_coef_frame.merge(
+                pd.DataFrame({
+                    'player_id': live_scalar_predictors,
+                    f'{target}_standard_error': live_standard_errors,
+                    f'{target}_margin_of_error': live_margin_of_errors,
+                    f'{target}_p_value': live_p_values,
+                    f'{target}_ci_lower': live_ci_lower,
+                    f'{target}_ci_upper': live_ci_upper,
+                }),
+                on='player_id',
+                how='left'
+            )
 
-            if not model_path_is_csv:
+            if not model_path_is_table:
                 model_data[model_type].update({
                     f'{target}_map_predictors': context_map_predictors,
                     f'{target}_map_scalar': context_map_scalar,
@@ -1505,23 +1976,34 @@ def wsba_rapm(
         else:
             live_coef_frame = pd.DataFrame({
                 'player_id': live_scalar_predictors,
-                target: live_scalar_values
+                target: live_scalar_values,
+                f'{target}_standard_error': live_standard_errors,
+                f'{target}_margin_of_error': live_margin_of_errors,
+                f'{target}_p_value': live_p_values,
+                f'{target}_ci_lower': live_ci_lower,
+                f'{target}_ci_upper': live_ci_upper
             })
 
         # Export
-        if not model_path_is_csv:
+        if not model_path_is_table:
             with open(model_path, 'w') as f:
                 json.dump(model_data, f, indent=2)
 
         model_rows.append(
-            _coef_row_from_saved_model(
+            coef_row(
                 metric=target,
                 strength_state=derived_strength_state,
                 season_value=season_value,
                 scalar_predictors=saved_predictors,
                 scalar_values=saved_values,
+                scalar_standard_errors=saved_standard_errors,
+                scalar_margin_of_errors=saved_margin_of_errors,
+                scalar_p_values=saved_p_values,
+                scalar_ci_lower=saved_ci_lower,
+                scalar_ci_upper=saved_ci_upper,
                 map_predictors=saved_map_predictors,
                 map_values=saved_map_values,
+                model_metrics=fit_metrics,
             )
         )
 
@@ -1537,7 +2019,7 @@ def wsba_rapm(
         defense_col_name = f'rapm_{defense_target_name}' if shot else f'rapm_{target}_against_per_sixty'
         offense_map_col_name = f'rapm_{target}_for_per_sixty_map'
         defense_map_col_name = f'rapm_{target}_against_per_sixty_map'
-        score_states = ['lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
+        score_states = ['tied', 'lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
         score_pattern = '|'.join(score_states)
         pattern_off_coa = r'^offense_coach_([A-ZÀ-ÖØ-Ý.\'\- ]+)_(\d{8})_([A-Z]{2,3})$'
         pattern_def_coa = r'^defense_coach_([A-ZÀ-ÖØ-Ý.\'\- ]+)_(\d{8})_([A-Z]{2,3})$'
@@ -1554,7 +2036,7 @@ def wsba_rapm(
         )
 
         offense_RAPM[['player_id', 'season']] = offense_RAPM[['player_id', 'season']].astype('Int64')
-        offense_rename = {target: offense_col_name}
+        offense_rename = interval_names(target, offense_col_name)
         if use_shift_map and not shot and f'{target}_map' in offense_RAPM.columns:
             offense_rename[f'{target}_map'] = offense_map_col_name
         offense_RAPM = offense_RAPM.rename(columns=offense_rename)
@@ -1568,7 +2050,7 @@ def wsba_rapm(
         )
 
         defense_RAPM[['player_id', 'season']] = defense_RAPM[['player_id', 'season']].astype('Int64')
-        defense_rename = {target: defense_col_name}
+        defense_rename = interval_names(target, defense_col_name)
         if use_shift_map and not shot and f'{target}_map' in defense_RAPM.columns:
             defense_rename[f'{target}_map'] = defense_map_col_name
         defense_RAPM = defense_RAPM.rename(columns=defense_rename)
@@ -1588,9 +2070,9 @@ def wsba_rapm(
 
         offense_coach_RAPM['season'] = offense_coach_RAPM['season'].astype('Int64')
         offense_coach_rename = {
-            target: f'rapm_systems_{target}_for_per_sixty',
             'player_id': 'coach_name'
         }
+        offense_coach_rename.update(interval_names(target, f'rapm_systems_{target}_for_per_sixty'))
         if use_shift_map and not shot and f'{target}_map' in offense_coach_RAPM.columns:
             offense_coach_rename[f'{target}_map'] = f'rapm_systems_{target}_for_per_sixty_map'
         offense_coach_RAPM = offense_coach_RAPM.rename(columns=offense_coach_rename)
@@ -1605,9 +2087,9 @@ def wsba_rapm(
 
         defense_coach_RAPM['season'] = defense_coach_RAPM['season'].astype('Int64')
         defense_coach_rename = {
-            target: f'rapm_systems_{target}_against_per_sixty',
             'player_id': 'coach_name'
         }
+        defense_coach_rename.update(interval_names(target, f'rapm_systems_{target}_against_per_sixty'))
         if use_shift_map and not shot and f'{target}_map' in defense_coach_RAPM.columns:
             defense_coach_rename[f'{target}_map'] = f'rapm_systems_{target}_against_per_sixty_map'
         defense_coach_RAPM = defense_coach_RAPM.rename(columns=defense_coach_rename)
@@ -1627,7 +2109,7 @@ def wsba_rapm(
                 temp = offense_score_coach.loc[offense_score_coach['score_state'] == state].copy()
                 if temp.empty:
                     continue
-                rename = {target: f'rapm_{state}_{target}_for_per_sixty'}
+                rename = interval_names(target, f'rapm_{state}_{target}_for_per_sixty')
                 if use_shift_map and not shot and f'{target}_map' in temp.columns:
                     rename[f'{target}_map'] = f'rapm_{state}_{target}_for_per_sixty_map'
                 offense_score_dfs.append(temp.rename(columns=rename)[['coach_name', 'season', 'team_abbr'] + list(rename.values())])
@@ -1645,7 +2127,7 @@ def wsba_rapm(
                 temp = defense_score_coach.loc[defense_score_coach['score_state'] == state].copy()
                 if temp.empty:
                     continue
-                rename = {target: f'rapm_{state}_{target}_against_per_sixty'}
+                rename = interval_names(target, f'rapm_{state}_{target}_against_per_sixty')
                 if use_shift_map and not shot and f'{target}_map' in temp.columns:
                     temp[f'{target}_map'] = temp[f'{target}_map'].map(
                         lambda encoded: transform_rapm_map(encoded, reverse_x=True) if pd.notna(encoded) else encoded
@@ -1666,7 +2148,7 @@ def wsba_rapm(
 
             third_RAPM[['player_id', 'season']] = third_RAPM[['player_id', 'season']].astype('Int64')
             third_RAPM = third_RAPM.rename(
-                columns={target: f"rapm_secondary_{target.replace('goals', 'assists')}"}
+                columns=interval_names(target, f"rapm_secondary_{target.replace('goals', 'assists')}")
             )
 
             fourth_RAPM = coefs.loc[
@@ -1679,7 +2161,7 @@ def wsba_rapm(
 
             fourth_RAPM[['player_id', 'season']] = fourth_RAPM[['player_id', 'season']].astype('Int64')
             fourth_RAPM = fourth_RAPM.rename(
-                columns={target: 'rapm_goals_against'}
+                columns=interval_names(target, 'rapm_goals_against')
             )
 
             goalie_df = pd.merge(second_df, fourth_RAPM)
@@ -1691,12 +2173,14 @@ def wsba_rapm(
         #Join and return final RAPM dataframe
         if shot:
             rapm_df = pd.merge(offense_RAPM, defense_RAPM, how='inner', on=['player_id', 'season', 'team_abbr'])
+            rapm_df = center_rapm_columns(rapm_df, [offense_col_name, defense_col_name])
             rapm_df['strength_state'] = strength_state
             rapm_df['season_type'] = 2
 
         else:
             if strength_state in ("even_strength", "all"):
                 rapm_df = pd.merge(offense_RAPM, defense_RAPM, how='inner', on=['player_id', 'season', 'team_abbr'])
+                rapm_df = center_rapm_columns(rapm_df, [offense_col_name, defense_col_name])
                 rapm_df["strength_state"] = strength_state
                 
                 coach_df = pd.merge(offense_coach_RAPM, defense_coach_RAPM, how='inner', on=['coach_name', 'season', 'team_abbr'])
@@ -1705,6 +2189,8 @@ def wsba_rapm(
             else:
                 offense_RAPM["strength_state"] = "power_play" if strength_state == "power_play" else "penalty_kill"
                 defense_RAPM["strength_state"] = "penalty_kill" if strength_state == "power_play" else "power_play"
+                offense_RAPM = center_rapm_columns(offense_RAPM, [offense_col_name])
+                defense_RAPM = center_rapm_columns(defense_RAPM, [defense_col_name])
                 rapm_df = pd.concat([offense_RAPM, defense_RAPM], ignore_index=True)
 
                 offense_coach_RAPM["strength_state"] = "power_play" if strength_state == "power_play" else "penalty_kill"
@@ -1713,16 +2199,11 @@ def wsba_rapm(
 
         #Convert log-odds to per-shot impact
         if shot:
-            p = model.predict_proba(sparse)[:, 1]
+            p = model.predict_proba(target_sparse)[:, 1]
             scale = np.mean(p * (1 - p))
 
-            for col in rapm_df.columns:
-                if 'rapm' in col:
-                    rapm_df[col] = rapm_df[col] * scale
-            
-            for col in goalie_df.columns:
-                if 'rapm' in col:
-                    goalie_df[col] = goalie_df[col] * scale
+            rapm_df = scale_shot_columns(rapm_df, scale)
+            goalie_df = scale_shot_columns(goalie_df, scale)
 
             goalie_dfs.append(goalie_df)
         else:
@@ -1733,12 +2214,47 @@ def wsba_rapm(
                 if systems_col in coach_df.columns:
                     toi = coach_df['time_on_ice'].fillna(0)
                     total = coach_df[systems_col].fillna(0).mul(toi).div(60)
+                    systems_se_col = f'{systems_col}_standard_error'
+                    systems_lower_col = f'{systems_col}_ci_lower'
+                    systems_upper_col = f'{systems_col}_ci_upper'
+                    total_var = None
+                    total_lower = None
+                    total_upper = None
+                    if systems_se_col in coach_df.columns:
+                        total_var = coach_df[systems_se_col].fillna(0).mul(toi).div(60) ** 2
+                    if systems_lower_col in coach_df.columns and systems_upper_col in coach_df.columns:
+                        total_lower = coach_df[systems_lower_col].fillna(0).mul(toi).div(60)
+                        total_upper = coach_df[systems_upper_col].fillna(0).mul(toi).div(60)
                     for state in score_states:
                         state_col = f'rapm_{state}_{target}_{side}_per_sixty'
                         state_toi_col = f'{state}_time_on_ice'
                         if state_col in coach_df.columns and state_toi_col in coach_df.columns:
-                            total = total.add(coach_df[state_col].fillna(0).mul(coach_df[state_toi_col].fillna(0)).div(60))
+                            state_toi = coach_df[state_toi_col].fillna(0)
+                            total = total.add(coach_df[state_col].fillna(0).mul(state_toi).div(60))
+                            state_se_col = f'{state_col}_standard_error'
+                            if total_var is not None and state_se_col in coach_df.columns:
+                                total_var = total_var.add(
+                                    coach_df[state_se_col].fillna(0).mul(state_toi).div(60) ** 2
+                                )
+                            state_lower_col = f'{state_col}_ci_lower'
+                            state_upper_col = f'{state_col}_ci_upper'
+                            if total_lower is not None and state_lower_col in coach_df.columns and state_upper_col in coach_df.columns:
+                                total_lower = total_lower.add(coach_df[state_lower_col].fillna(0).mul(state_toi).div(60))
+                                total_upper = total_upper.add(coach_df[state_upper_col].fillna(0).mul(state_toi).div(60))
                     coach_df[total_col] = np.where(toi > 0, total.div(toi).mul(60), np.nan)
+                    if total_var is not None:
+                        total_se_col = f'{total_col}_standard_error'
+                        coach_df[total_se_col] = np.where(toi > 0, np.sqrt(total_var).div(toi).mul(60), np.nan)
+                        coach_df[f'{total_col}_p_value'] = coefficient_p_values(coach_df[total_col], coach_df[total_se_col])
+                    if total_lower is not None and total_upper is not None:
+                        total_lower_col = f'{total_col}_ci_lower'
+                        total_upper_col = f'{total_col}_ci_upper'
+                        coach_df[total_lower_col] = np.where(toi > 0, total_lower.div(toi).mul(60), np.nan)
+                        coach_df[total_upper_col] = np.where(toi > 0, total_upper.div(toi).mul(60), np.nan)
+                        coach_df[f'{total_col}_margin_of_error'] = np.maximum(
+                            np.abs(coach_df[total_col] - coach_df[total_lower_col]),
+                            np.abs(coach_df[total_upper_col] - coach_df[total_col])
+                        )
                 systems_map_col = f'rapm_systems_{target}_{side}_per_sixty_map'
                 total_map_col = f'rapm_{target}_{side}_per_sixty_map'
                 if systems_map_col in coach_df.columns:
@@ -1751,18 +2267,18 @@ def wsba_rapm(
     df = reduce(lambda left, right: pd.merge(left, right, how='outer'), rapm_dfs)
     df2 = reduce(lambda left, right: pd.merge(left, right, how='outer'), (goalie_dfs if shot else coach_dfs))
 
-    if model_path_is_csv:
+    if model_path_is_table:
         new_model_df = pd.DataFrame(model_rows)
         if Path(model_path).exists():
             try:
-                existing_model_df = pd.read_csv(model_path)
+                existing_model_df = read_model_table(model_path)
             except Exception:
                 existing_model_df = pd.DataFrame()
         else:
             existing_model_df = pd.DataFrame()
 
-        merged_model_df = _merge_model_rows(existing_model_df, new_model_df)
-        merged_model_df.to_csv(model_path, index=False)
+        merged_model_df = merge_model_rows(existing_model_df, new_model_df)
+        write_model_table(merged_model_df, model_path)
 
     return df, df2
 
@@ -1806,7 +2322,7 @@ def rapm_grid(
     if strength == 'even_strength':
         return ev_for, ev_against
 
-    seasons = _season_values(season)
+    seasons = season_values(season)
     if seasons is not None:
         rapm = rapm.loc[rapm['season'].isin(seasons)]
 
@@ -1814,12 +2330,12 @@ def rapm_grid(
     player_rows = rapm.loc[(rapm[group_id] == entity_id) & (rapm['strength_state'] == strength)]
 
     return (
-        _weighted_map_average(player_rows, f'rapm_{metric}_for_per_sixty_map'),
-        _weighted_map_average(player_rows, f'rapm_{metric}_against_per_sixty_map'),
+        weighted_map(player_rows, f'rapm_{metric}_for_per_sixty_map'),
+        weighted_map(player_rows, f'rapm_{metric}_against_per_sixty_map'),
     )
 
 
-def _weighted_map_average(rows, map_col):
+def weighted_map(rows, map_col):
     if rows.empty or map_col not in rows.columns:
         return np.zeros(MAP_SHAPE, dtype=np.float32)
 
@@ -1850,7 +2366,7 @@ def rapm_four_maps(
         else:
             group = 'coach'
 
-    seasons = _season_values(season)
+    seasons = season_values(season)
     if seasons is not None:
         rapm = rapm.loc[rapm['season'].isin(seasons)]
 
@@ -1863,10 +2379,10 @@ def rapm_four_maps(
         'penalty_kill': player_rows.loc[player_rows['strength_state'] == 'penalty_kill'],
     }
 
-    ev_for = _weighted_map_average(strength_rows['even_strength'], f'rapm_{metric}_for_per_sixty_map')
-    ev_against = _weighted_map_average(strength_rows['even_strength'], f'rapm_{metric}_against_per_sixty_map')
-    st_for = _weighted_map_average(strength_rows['power_play'], f'rapm_{metric}_for_per_sixty_map')
-    st_against = _weighted_map_average(strength_rows['penalty_kill'], f'rapm_{metric}_against_per_sixty_map')
+    ev_for = weighted_map(strength_rows['even_strength'], f'rapm_{metric}_for_per_sixty_map')
+    ev_against = weighted_map(strength_rows['even_strength'], f'rapm_{metric}_against_per_sixty_map')
+    st_for = weighted_map(strength_rows['power_play'], f'rapm_{metric}_for_per_sixty_map')
+    st_against = weighted_map(strength_rows['penalty_kill'], f'rapm_{metric}_against_per_sixty_map')
 
     return ev_for, ev_against, st_for, st_against
 
@@ -1974,7 +2490,7 @@ def plot_rapm_map(
     cbar.set_label(f'Isolated {metric.replace("_", " ").title()}/60', fontsize=12)
     
     strengths_title = strength.replace("_", " ").title()
-    seasons = _season_values(season)
+    seasons = season_values(season)
     season_label = seasons[0] if seasons and len(seasons) == 1 else f"{seasons[0]}-{seasons[-1]}" if seasons else "All Seasons"
     
     fig.text(0.51, 0.175, f'Strength(s)', ha='center', fontsize=10)

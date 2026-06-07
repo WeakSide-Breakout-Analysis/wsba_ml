@@ -4,3 +4,12 @@ team_data/
 __pycache__/
 **/__pycache__/
 game_score/*.pkl
+.env
+wsba_db.py
+data_workflows.py
+microstat.py
+rapm/*.parquet
+rapm/priors
+rapm/prior_stat_coefficient_maps
+rapm/wsba_rapm_prior.csv
+rapm/plot_feature_coefficients.py

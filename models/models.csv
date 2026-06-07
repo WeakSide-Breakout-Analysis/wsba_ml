@@ -1,0 +1,8 @@
+﻿model_id,model_name,method_id,method_name,description
+wsba-xg,Expected Goals,gradient-boosting,Gradient Boosting,
+wsba-rapm-shots,Shots RAPM,linear-regression-ridge,Ridge Regression,
+wsba-rapm-goals,Goals RAPM,logistic-regression,Logistic Regression,
+wsba-rapm-penalties,Penalties RAPM,linear-regression-ridge,Ridge Regression,
+wsba-gar,Goals Above Replacement,,,
+wsba-gs,Game Score,random-forest,Random Forest,
+wsba-gse,Game Simulation Engine,,,
