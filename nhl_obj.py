@@ -33,6 +33,34 @@ def _load_placeholder_name_pool():
 
 
 PLACEHOLDER_NAME_POOL = _load_placeholder_name_pool()
+LEAGUE_AVERAGE_SIM_RATES = {
+    "shot_rate": 12.0,
+    "fenwick_per_corsi": 0.695,
+    "shots_per_fenwick": 0.662,
+    "xg_per_fenwick": 0.064,
+    "primary_pass_rate": 4.5,
+    "secondary_pass_rate": 3.5,
+    "block_rate": 2.2,
+    "penalties_taken_rate": 0.45,
+    "penalties_drawn_rate": 0.45,
+}
+
+
+def _sim_positive_value(value, default):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(numeric) or numeric <= 0.0:
+        return float(default)
+    return numeric
+
+
+def _sim_probability_value(value, default):
+    numeric = _sim_positive_value(value, default)
+    if numeric > 1.0 and numeric <= 100.0:
+        numeric /= 100.0
+    return float(np.clip(numeric, 0.0, 1.0))
 COACH_SCORE_STATES = ['tied', 'lead_1', 'lead_2', 'lead_3_plus', 'behind_1', 'behind_2', 'behind_3_plus']
 COACH_SCORE_METRICS = ['corsi', 'fenwick', 'expected_goals', 'goals']
 COACH_SCORE_SIDES = ['for', 'against']
@@ -232,15 +260,42 @@ class NHLPlayer:
             self.drawn_pens = self._select_data(player_data, 'rapm_penalty_minutes_against_per_sixty')
 
             ## TENDENCIES
-            self.shot_rate = self._select_data(player_data, 'corsi_per_sixty')
-            self.fenwick_per_corsi = self._select_data(player_data, 'fenwick_per_corsi')
-            self.shots_per_fenwick = self._select_data(player_data, 'shots_per_fenwick')
-            self.xg_per_fenwick = self._select_data(player_data, 'expected_goals_per_fenwick')
-            self.primary_pass_rate = self._select_data(player_data, 'primary_fenwick_assists_per_sixty')
-            self.secondary_pass_rate = self._select_data(player_data, 'secondary_fenwick_assists_per_sixty')
-            self.block_rate = self._select_data(player_data, 'blocked_shots_per_sixty')
-            self.penalties_taken_rate = self._select_data(player_data, 'minor_penalties_per_sixty')
-            self.penalties_drawn_rate = self._select_data(player_data, 'minor_penalties_drawn_per_sixty')
+            self.shot_rate = _sim_positive_value(
+                self._select_data(player_data, 'corsi_per_sixty'),
+                LEAGUE_AVERAGE_SIM_RATES["shot_rate"],
+            )
+            self.fenwick_per_corsi = _sim_probability_value(
+                self._select_data(player_data, 'fenwick_per_corsi'),
+                LEAGUE_AVERAGE_SIM_RATES["fenwick_per_corsi"],
+            )
+            self.shots_per_fenwick = _sim_probability_value(
+                self._select_data(player_data, 'shots_per_fenwick'),
+                LEAGUE_AVERAGE_SIM_RATES["shots_per_fenwick"],
+            )
+            self.xg_per_fenwick = _sim_positive_value(
+                self._select_data(player_data, 'expected_goals_per_fenwick', self._select_data(player_data, 'xg_per_fenwick')),
+                LEAGUE_AVERAGE_SIM_RATES["xg_per_fenwick"],
+            )
+            self.primary_pass_rate = _sim_positive_value(
+                self._select_data(player_data, 'primary_fenwick_assists_per_sixty'),
+                LEAGUE_AVERAGE_SIM_RATES["primary_pass_rate"],
+            )
+            self.secondary_pass_rate = _sim_positive_value(
+                self._select_data(player_data, 'secondary_fenwick_assists_per_sixty'),
+                LEAGUE_AVERAGE_SIM_RATES["secondary_pass_rate"],
+            )
+            self.block_rate = _sim_positive_value(
+                self._select_data(player_data, 'blocked_shots_per_sixty'),
+                LEAGUE_AVERAGE_SIM_RATES["block_rate"],
+            )
+            self.penalties_taken_rate = _sim_positive_value(
+                self._select_data(player_data, 'minor_penalties_per_sixty'),
+                LEAGUE_AVERAGE_SIM_RATES["penalties_taken_rate"],
+            )
+            self.penalties_drawn_rate = _sim_positive_value(
+                self._select_data(player_data, 'minor_penalties_drawn_per_sixty'),
+                LEAGUE_AVERAGE_SIM_RATES["penalties_drawn_rate"],
+            )
             self.giveaways_rate = self._select_data(player_data, 'giveaways_per_sixty')
             self.takeaways_rate = self._select_data(player_data, 'takeaways_per_sixty')
             self.hits_for_rate = self._select_data(player_data, 'hits_for_per_sixty')
@@ -677,7 +732,7 @@ class NHLTeam:
             'shot_rate': 'corsi_per_sixty',
             'fenwick_per_corsi': 'fenwick_per_corsi',
             'shots_per_fenwick': 'shots_per_fenwick',
-            'xg_per_fenwick': 'xg_per_fenwick',
+            'xg_per_fenwick': 'expected_goals_per_fenwick',
             'primary_pass_rate': 'primary_fenwick_assists_per_sixty',
             'secondary_pass_rate': 'secondary_fenwick_assists_per_sixty',
             'block_rate': 'blocked_shots_per_sixty',

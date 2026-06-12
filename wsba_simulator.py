@@ -27,6 +27,8 @@ EV_CORSI = 59.78943931605245
 PP_CORSI = 109.00146851959991
 PK_CORSI = 17.681283782423215
 EN_CORSI = 37.72137395073106
+LEAGUE_FENWICK_PER_CORSI = EV_FENWICK / EV_CORSI
+LEAGUE_SHOTS_PER_FENWICK = 0.662
 EV_EXPECTED_GOALS = GOALS_PER_FENWICK * EV_FENWICK
 PP_EXPECTED_GOALS = GOALS_PER_FENWICK * PP_FENWICK
 PK_EXPECTED_GOALS = GOALS_PER_FENWICK * PK_FENWICK
@@ -88,6 +90,18 @@ def _safe_rate(value):
         return 0.0
     value = float(value)
     return value if value > 0.0 else 0.0
+
+
+def _safe_probability(value, fallback):
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        probability = float(fallback)
+    if not np.isfinite(probability) or probability <= 0.0:
+        probability = float(fallback)
+    elif probability > 1.0 and probability <= 100.0:
+        probability /= 100.0
+    return float(np.clip(probability, 0.0, 1.0))
 
 def _load_goalie_pull_curves():
     out = {}
@@ -786,6 +800,8 @@ class WSBASimulation:
 
         season_type = self.season_type
         reg_periods = self.reg_periods
+        home = self.home
+        away = self.away
         home_team_abbr = self.home.team_abbr
         away_team_abbr = self.away.team_abbr
         home_skaters = self.home_skaters
@@ -1564,7 +1580,8 @@ class WSBASimulation:
                 sim_game.last_shot_team_venue = event_team_venue
 
                 # Determine if a corsi shot attempt is unblocked (becoming a fenwick shot)
-                if np.random.rand() >= event_player_1.fenwick_per_corsi:
+                fenwick_per_corsi = _safe_probability(event_player_1.fenwick_per_corsi, LEAGUE_FENWICK_PER_CORSI)
+                if np.random.rand() >= fenwick_per_corsi:
                     event_type = 'blocked-shot'
 
                     # Randomly selecting the blocking player
@@ -1680,7 +1697,8 @@ class WSBASimulation:
                             _handle_goalie_return_after_empty_net_goal(event_team_venue)
                         _expire_goal_penalty(event_team_venue)
                     # Randomly determine if a fenwick shot attempt reaches net
-                    elif np.random.rand() >= event_player_1.shots_per_fenwick:
+                    shots_per_fenwick = _safe_probability(event_player_1.shots_per_fenwick, LEAGUE_SHOTS_PER_FENWICK)
+                    if np.random.rand() >= shots_per_fenwick:
                         event_type = 'missed-shot'
                     else:
                         event_type = 'shot-on-goal'
