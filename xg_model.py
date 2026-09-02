@@ -1,5 +1,11 @@
 import os
 import json as json_lib
+import shutil
+import subprocess
+import warnings
+from numbers import Integral
+from typing import Literal, Optional, Sequence, Union
+
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -7,13 +13,192 @@ import scipy.sparse as sp
 import matplotlib.pyplot as plt
 import wsba_hockey as wsba
 from wsba_hockey.tools.scraping import adjust_coords
-from typing import Literal
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import roc_curve, auc
 from sklearn.model_selection import GroupKFold
 
+try:
+    import dask.array as da
+    from dask.distributed import Client
+    from dask_cuda import LocalCUDACluster
+    from xgboost import dask as dxgb
+except (ImportError, OSError, RuntimeError):
+    da = None
+    Client = None
+    LocalCUDACluster = None
+    dxgb = None
+
 ### XG_MODEL FUNCTIONS ###
 # Provided in this file are functions vital to the goal prediction model in the WSBA Hockey Python package. #
+
+
+def _xgb_cuda_build_available():
+    """Return whether the installed XGBoost build has CUDA support."""
+    build_info = getattr(xgb, 'build_info', None)
+    if build_info is None:
+        return None
+    try:
+        cuda_flag = build_info().get('USE_CUDA')
+    except Exception:
+        return None
+    if cuda_flag is None:
+        return None
+    return str(cuda_flag).upper() in {'ON', 'TRUE', '1'}
+
+
+def _visible_cuda_devices():
+    """Return the NVIDIA devices visible to this process."""
+    if _xgb_cuda_build_available() is False:
+        return []
+
+    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if cuda_visible_devices is not None:
+        visible_devices = [device.strip() for device in cuda_visible_devices.split(',') if device.strip()]
+        return [] if not visible_devices or '-1' in visible_devices else visible_devices
+
+    nvidia_smi = shutil.which('nvidia-smi')
+    if nvidia_smi is None:
+        return []
+
+    try:
+        result = subprocess.run(
+            [nvidia_smi, '--list-gpus'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _cuda_runtime_available():
+    """Return whether an NVIDIA CUDA device is visible to this process."""
+    return bool(_visible_cuda_devices())
+
+
+def _resolve_cuda(cuda: Optional[bool]):
+    """Resolve the CUDA setting while preserving CPU operation on CPU-only hosts."""
+    if cuda is None:
+        return _cuda_runtime_available()
+    cuda = bool(cuda)
+    if cuda and _xgb_cuda_build_available() is False:
+        raise RuntimeError('cuda=True requires an XGBoost build compiled with CUDA support.')
+    return cuda
+
+
+def _normalize_cuda_devices(cuda_devices: Optional[Union[int, Sequence[int]]]):
+    """Normalize an optional GPU selection to a validated list of ordinals."""
+    if cuda_devices is None:
+        return None
+    if isinstance(cuda_devices, Integral):
+        cuda_devices = [cuda_devices]
+    cuda_devices = list(cuda_devices)
+    if not cuda_devices or any(not isinstance(device, Integral) or device < 0 for device in cuda_devices):
+        raise ValueError('cuda_devices must be None, a non-negative integer, or a non-empty sequence of non-negative integers')
+    cuda_devices = [int(device) for device in cuda_devices]
+    if len(set(cuda_devices)) != len(cuda_devices):
+        raise ValueError('cuda_devices cannot contain duplicate GPU ordinals')
+    return cuda_devices
+
+
+def _xgb_device_params(cuda: bool, cuda_devices: Optional[Union[int, Sequence[int]]] = None):
+    """Return XGBoost GPU parameters compatible with the installed XGBoost API."""
+    if not cuda:
+        return {}
+    cuda_devices = _normalize_cuda_devices(cuda_devices)
+    cuda_device = 0 if cuda_devices is None else cuda_devices[0]
+
+    major_version = int(xgb.__version__.split('.', 1)[0])
+    if major_version >= 2:
+        return {
+            'tree_method': 'hist',
+            'device': f'cuda:{cuda_device}',
+        }
+    return {
+        'tree_method': 'gpu_hist',
+        'gpu_id': cuda_device,
+        'predictor': 'gpu_predictor',
+    }
+
+
+def _dask_cuda_modules():
+    """Load the optional Dask CUDA backend used for multi-GPU XGBoost."""
+    if any(module is None for module in (da, Client, LocalCUDACluster, dxgb)):
+        return None
+    return da, Client, LocalCUDACluster, dxgb
+
+
+def _xgb_dask_device_params():
+    """Return GPU parameters for XGBoost's one-process-per-GPU Dask backend."""
+    major_version = int(xgb.__version__.split('.', 1)[0])
+    if major_version >= 2:
+        return {'tree_method': 'hist', 'device': 'cuda'}
+    return {'tree_method': 'gpu_hist'}
+
+
+def _xgb_dask_train(predictors, labels, params, num_boost_round, cuda_devices=None):
+    """Train one distributed XGBoost booster across all visible GPUs."""
+    modules = _dask_cuda_modules()
+    if modules is None:
+        return None
+
+    da, Client, LocalCUDACluster, dxgb = modules
+    cuda_devices = _normalize_cuda_devices(cuda_devices)
+    available_devices = _visible_cuda_devices()
+    n_gpus = len(available_devices) if cuda_devices is None else len(cuda_devices)
+    if n_gpus < 2:
+        return None
+
+    rows_per_chunk = max(1, min(len(labels), 100_000))
+    features = da.from_array(predictors, chunks=(rows_per_chunk, predictors.shape[1]))
+    targets = da.from_array(np.asarray(labels).ravel(), chunks=rows_per_chunk)
+    dask_params = dict(params)
+    dask_params.pop('gpu_id', None)
+    dask_params.pop('predictor', None)
+    dask_params.update(_xgb_dask_device_params())
+
+    cluster_kwargs = {'n_workers': n_gpus, 'threads_per_worker': 1}
+    if cuda_devices is not None:
+        cluster_kwargs['CUDA_VISIBLE_DEVICES'] = cuda_devices
+    with LocalCUDACluster(**cluster_kwargs) as cluster:
+        with Client(cluster) as client:
+            dtrain = dxgb.DaskDMatrix(client, features, targets)
+            result = dxgb.train(
+                client,
+                dask_params,
+                dtrain,
+                num_boost_round=num_boost_round,
+            )
+    return result['booster']
+
+
+def _xgb_dask_predict(predictors, model, cuda_devices=None):
+    """Predict with a trained booster across all visible GPUs when available."""
+    modules = _dask_cuda_modules()
+    if modules is None:
+        return None
+
+    da, Client, LocalCUDACluster, dxgb = modules
+    cuda_devices = _normalize_cuda_devices(cuda_devices)
+    available_devices = _visible_cuda_devices()
+    n_gpus = len(available_devices) if cuda_devices is None else len(cuda_devices)
+    if n_gpus < 2:
+        return None
+
+    rows_per_chunk = max(1, min(predictors.shape[0], 100_000))
+    features = da.from_array(predictors, chunks=(rows_per_chunk, predictors.shape[1]))
+    cluster_kwargs = {'n_workers': n_gpus, 'threads_per_worker': 1}
+    if cuda_devices is not None:
+        cluster_kwargs['CUDA_VISIBLE_DEVICES'] = cuda_devices
+    with LocalCUDACluster(**cluster_kwargs) as cluster:
+        with Client(cluster) as client:
+            predictions = dxgb.predict(client, model, features)
+            return np.asarray(predictions.compute())
 
 def fix_players(pbp):
     #Add/fix player info for shooters and goaltenders
@@ -275,8 +460,26 @@ def prep_xG_data(pbp):
     #Return: pbp data prepared to train and calculate the xG model
     return pbp
 
-def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist', states = False, hypertune = False, train = False, test_path = wsba.TEST_PATH, cv_path = wsba.CV_PATH, model_path = wsba.XG_MODEL, train_runs = 20, cv_runs = 20, strengths = None, empty_net = False):
+def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist', states = False, hypertune = False, train = False, test_path = wsba.TEST_PATH, cv_path = wsba.CV_PATH, model_path = wsba.XG_MODEL, train_runs = 20, cv_runs = 20, strengths = None, empty_net = False, cuda: Optional[bool] = None, cuda_devices: Optional[Union[int, Sequence[int]]] = None):
     #Train and calculate the WSBA Expected Goals model
+
+    cuda = _resolve_cuda(cuda)
+    cuda_devices = _normalize_cuda_devices(cuda_devices)
+    xgb_device_params = _xgb_device_params(cuda, cuda_devices)
+    visible_cuda_devices = _visible_cuda_devices() if cuda else []
+    requested_cuda_devices = visible_cuda_devices if cuda_devices is None else cuda_devices
+    multi_gpu_requested = bool(cuda and len(requested_cuda_devices) > 1)
+    if cuda:
+        selected_device = 0 if cuda_devices is None else cuda_devices[0]
+        print(f'CUDA enabled for XGBoost on device {selected_device}.')
+    if multi_gpu_requested:
+        print(f'Multi-GPU training requested across {len(requested_cuda_devices)} visible devices.')
+        if _dask_cuda_modules() is None:
+            warnings.warn(
+                'Dask CUDA is not installed; falling back to the selected XGBoost GPU.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
     
     #Add index for future merging
     pbp['event_index'] = pbp.index
@@ -350,7 +553,8 @@ def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist',
                         "subsample": np.random.uniform(0.76, 0.84),
                         "colsample_bytree": np.random.uniform(0.76, 0.8),
                         "min_child_weight": np.random.randint(5, 23),
-                        "max_delta_step": np.random.randint(4, 9)
+                        "max_delta_step": np.random.randint(4, 9),
+                        **xgb_device_params,
                     }
                     seed = np.random.randint(0, 10000)
                     np.random.seed(seed)
@@ -384,6 +588,7 @@ def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist',
                     "colsample_bytree": best_all['colsample_bytree'].iloc[0],
                     "min_child_weight": int(best_all['min_child_weight'].iloc[0]),
                     "max_delta_step": int(best_all['max_delta_step'].iloc[0]),
+                    **xgb_device_params,
                 }
 
                 cv_test = pd.DataFrame(columns=["AUC_rounds", "AUC", "LL_rounds", "LL", "seed"])
@@ -428,17 +633,35 @@ def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist',
                     "colsample_bytree": best_all['colsample_bytree'].iloc[0],
                     "min_child_weight": int(best_all['min_child_weight'].iloc[0]),
                     "max_delta_step": int(best_all['max_delta_step'].iloc[0]),
+                    **xgb_device_params,
                 }
 
             print('Training model...')
             seed = int(cv_final['seed'].iloc[0])
             np.random.seed(seed)
-            model = xgb.train(
-                params=params_grid,
-                dtrain=xgb_matrix,
-                num_boost_round=int(cv_final['AUC_rounds'].iloc[0]),
-                verbose_eval=2,
-            )
+            model = None
+            if multi_gpu_requested:
+                try:
+                    model = _xgb_dask_train(
+                        predictors,
+                        is_goal_vect,
+                        params_grid,
+                        int(cv_final['AUC_rounds'].iloc[0]),
+                        cuda_devices=cuda_devices,
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f'Multi-GPU XGBoost training failed ({exc}); falling back to a single GPU.',
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            if model is None:
+                model = xgb.train(
+                    params=params_grid,
+                    dtrain=xgb_matrix,
+                    num_boost_round=int(cv_final['AUC_rounds'].iloc[0]),
+                    verbose_eval=2,
+                )
             
             #Save model
             model.save_model(model_path)
@@ -449,7 +672,21 @@ def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist',
             #Load model
             model = xgb.Booster()
             model.load_model(model_path)
-            training['xG'] = model.predict(xgb_matrix)
+            predictions = None
+            if multi_gpu_requested:
+                try:
+                    predictions = _xgb_dask_predict(predictors, model, cuda_devices=cuda_devices)
+                except Exception as exc:
+                    warnings.warn(
+                        f'Multi-GPU XGBoost prediction failed ({exc}); falling back to a single GPU.',
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            if predictions is None:
+                if xgb_device_params:
+                    model.set_param(xgb_device_params)
+                predictions = model.predict(xgb_matrix)
+            training['xG'] = predictions
             xg_data = training
 
             #Add xG columns

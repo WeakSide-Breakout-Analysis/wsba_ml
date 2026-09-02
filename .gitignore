@@ -13,3 +13,7 @@ rapm/priors
 rapm/prior_stat_coefficient_maps
 rapm/wsba_rapm_prior.csv
 rapm/plot_feature_coefficients.py
+.freebuff
+.cache
+essm.py
+essm
