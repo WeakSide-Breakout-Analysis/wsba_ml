@@ -1,815 +1,439 @@
-import os
-import json as json_lib
-import shutil
-import subprocess
-import warnings
-from numbers import Integral
-from typing import Literal, Optional, Sequence, Union
+"""WSBA expected-goals model.
 
-import pandas as pd
+Python version of the corrected xG notebook. Training and prediction use the
+same Polars preparation and CSR XGBoost matrices.
+"""
+
+import json
+from pathlib import Path
+
 import numpy as np
-import xgboost as xgb
+import pandas as pd
+import polars as pl
 import scipy.sparse as sp
-import matplotlib.pyplot as plt
+import torch
+import xgboost as xgb
 import wsba_hockey as wsba
-from wsba_hockey.tools.scraping import adjust_coords
-from sklearn.calibration import calibration_curve
-from sklearn.metrics import roc_curve, auc
 from sklearn.model_selection import GroupKFold
-
-try:
-    import dask.array as da
-    from dask.distributed import Client
-    from dask_cuda import LocalCUDACluster
-    from xgboost import dask as dxgb
-except (ImportError, OSError, RuntimeError):
-    da = None
-    Client = None
-    LocalCUDACluster = None
-    dxgb = None
-
-### XG_MODEL FUNCTIONS ###
-# Provided in this file are functions vital to the goal prediction model in the WSBA Hockey Python package. #
+from wsba_hockey.tools.scraping import fix_players
 
 
-def _xgb_cuda_build_available():
-    """Return whether the installed XGBoost build has CUDA support."""
-    build_info = getattr(xgb, 'build_info', None)
-    if build_info is None:
-        return None
-    try:
-        cuda_flag = build_info().get('USE_CUDA')
-    except Exception:
-        return None
-    if cuda_flag is None:
-        return None
-    return str(cuda_flag).upper() in {'ON', 'TRUE', '1'}
+TARGET = "is_goal"
+FEATURES = [
+    "event_distance", "event_angle", "distance_from_last", "angle_from_last",
+    "seconds_since_last", "speed_from_last", "speed_of_angle_from_last",
+    "event_player_1_shift_time_on_ice",
+    "event_on_ice_against_min_shift_time_on_ice",
+    "event_on_ice_against_avg_shift_time_on_ice",
+    "event_on_ice_against_max_shift_time_on_ice",
+    "wrist", "deflected", "tip-in", "slap", "backhand", "snap",
+    "wrap-around", "poke", "bat", "cradle", "between-legs", "other-shot",
+    "prior_same", "prior_shot-on-goal", "prior_missed-shot", "prior_blocked-shot",
+    "prior_giveaway", "prior_takeaway", "prior_hit", "prior_faceoff",
+    "strength_3v3", "strength_3v4", "strength_3v5", "strength_4v3", "strength_4v4",
+    "strength_4v5", "strength_4v6", "strength_5v3", "strength_5v4", "strength_5v5",
+    "strength_5v6", "strength_6v4", "strength_6v5", "empty_net", "offwing",
+    "short", "failed_bank", "cross_ice", "rebound", "rush",
+]
+MODEL_STRENGTHS = {
+    "ev": wsba.STRENGTH_GROUPS["even_strength"],
+    "pp": wsba.STRENGTH_GROUPS["power_play"] + ["6v4", "6v5"],
+    "pk": wsba.STRENGTH_GROUPS["penalty_kill"],
+    "en": wsba.STRENGTHS,
+}
+
+XG_MODEL_DIR = Path(__file__).resolve().parent / "xg_model"
+MODEL_DIR = XG_MODEL_DIR / "models"
+TUNING_DIR = XG_MODEL_DIR / "tuning"
+CV_DIR = XG_MODEL_DIR / "cv"
+METRICS_PATH = XG_MODEL_DIR / "wsba_xg_overall_metrics.json"
+
+HYPERPARAMETER_SPACE = {
+    "eta": {"kind": "uniform", "low": 0.03, "high": 0.15, "default": 0.1},
+    "gamma": {"kind": "uniform", "low": 0.0, "high": 0.5, "default": 0.0},
+    "max_depth": {"kind": "int", "low": 3, "high": 10, "default": 6},
+    "min_child_weight": {"kind": "int", "low": 1, "high": 30, "default": 1},
+    "max_delta_step": {"kind": "int", "low": 0, "high": 10, "default": 0},
+    "subsample": {"kind": "uniform", "low": 0.65, "high": 1.0, "default": 1.0},
+    "colsample_bytree": {"kind": "uniform", "low": 0.65, "high": 1.0, "default": 1.0},
+    "colsample_bylevel": {"kind": "uniform", "low": 0.65, "high": 1.0, "default": 1.0},
+    "colsample_bynode": {"kind": "uniform", "low": 0.65, "high": 1.0, "default": 1.0},
+    "reg_alpha": {"kind": "loguniform", "low": 0.0001, "high": 10.0, "default": 0.0},
+    "reg_lambda": {"kind": "loguniform", "low": 0.1, "high": 20.0, "default": 1.0},
+    "max_bin": {"kind": "int", "low": 128, "high": 512, "default": 256},
+    "grow_policy": {"kind": "choice", "values": ["depthwise", "lossguide"], "default": "depthwise"},
+    "max_leaves": {"kind": "int", "low": 0, "high": 128, "default": 0},
+    "scale_pos_weight": {"kind": "uniform", "low": 1.0, "high": 12.0, "default": 1.0},
+}
+TUNED_HYPERPARAMETERS = [
+    "eta", "gamma", "max_depth", "min_child_weight", "max_delta_step",
+    "subsample", "colsample_bytree",
+]
+HYPERPARAMETERS = {name: {} for name in MODEL_STRENGTHS}
 
 
-def _visible_cuda_devices():
-    """Return the NVIDIA devices visible to this process."""
-    if _xgb_cuda_build_available() is False:
-        return []
-
-    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    if cuda_visible_devices is not None:
-        visible_devices = [device.strip() for device in cuda_visible_devices.split(',') if device.strip()]
-        return [] if not visible_devices or '-1' in visible_devices else visible_devices
-
-    nvidia_smi = shutil.which('nvidia-smi')
-    if nvidia_smi is None:
-        return []
-
-    try:
-        result = subprocess.run(
-            [nvidia_smi, '--list-gpus'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if result.returncode != 0:
-        return []
-    return [line for line in result.stdout.splitlines() if line.strip()]
+def _as_polars(frame):
+    if isinstance(frame, pl.DataFrame):
+        return frame.clone(), False
+    if isinstance(frame, pd.DataFrame):
+        converted = pl.DataFrame(frame.to_dict(orient="records"), infer_schema_length=None)
+        return converted.with_columns(pl.col(pl.Float32, pl.Float64).fill_nan(None)), True
+    raise TypeError("xG data must be a Polars or Pandas DataFrame")
 
 
-def _cuda_runtime_available():
-    """Return whether an NVIDIA CUDA device is visible to this process."""
-    return bool(_visible_cuda_devices())
+def _sample_parameter(name, parameter_space):
+    spec = parameter_space[name]
+    if spec["kind"] == "uniform":
+        return float(np.random.uniform(spec["low"], spec["high"]))
+    if spec["kind"] == "int":
+        return int(np.random.randint(spec["low"], spec["high"] + 1))
+    if spec["kind"] == "choice":
+        return np.random.choice(spec["values"]).item()
+    if spec["kind"] == "loguniform":
+        return float(np.exp(np.random.uniform(np.log(spec["low"]), np.log(spec["high"]))))
+    raise ValueError(f"Unknown search-space kind for {name}: {spec['kind']}")
 
 
-def _resolve_cuda(cuda: Optional[bool]):
-    """Resolve the CUDA setting while preserving CPU operation on CPU-only hosts."""
-    if cuda is None:
-        return _cuda_runtime_available()
-    cuda = bool(cuda)
-    if cuda and _xgb_cuda_build_available() is False:
-        raise RuntimeError('cuda=True requires an XGBoost build compiled with CUDA support.')
-    return cuda
+def _export_parameters(params):
+    return {key: ",".join(value) if isinstance(value, list) else value for key, value in params.items()}
 
-
-def _normalize_cuda_devices(cuda_devices: Optional[Union[int, Sequence[int]]]):
-    """Normalize an optional GPU selection to a validated list of ordinals."""
-    if cuda_devices is None:
-        return None
-    if isinstance(cuda_devices, Integral):
-        cuda_devices = [cuda_devices]
-    cuda_devices = list(cuda_devices)
-    if not cuda_devices or any(not isinstance(device, Integral) or device < 0 for device in cuda_devices):
-        raise ValueError('cuda_devices must be None, a non-negative integer, or a non-empty sequence of non-negative integers')
-    cuda_devices = [int(device) for device in cuda_devices]
-    if len(set(cuda_devices)) != len(cuda_devices):
-        raise ValueError('cuda_devices cannot contain duplicate GPU ordinals')
-    return cuda_devices
-
-
-def _xgb_device_params(cuda: bool, cuda_devices: Optional[Union[int, Sequence[int]]] = None):
-    """Return XGBoost GPU parameters compatible with the installed XGBoost API."""
-    if not cuda:
-        return {}
-    cuda_devices = _normalize_cuda_devices(cuda_devices)
-    cuda_device = 0 if cuda_devices is None else cuda_devices[0]
-
-    major_version = int(xgb.__version__.split('.', 1)[0])
-    if major_version >= 2:
-        return {
-            'tree_method': 'hist',
-            'device': f'cuda:{cuda_device}',
-        }
-    return {
-        'tree_method': 'gpu_hist',
-        'gpu_id': cuda_device,
-        'predictor': 'gpu_predictor',
-    }
-
-
-def _dask_cuda_modules():
-    """Load the optional Dask CUDA backend used for multi-GPU XGBoost."""
-    if any(module is None for module in (da, Client, LocalCUDACluster, dxgb)):
-        return None
-    return da, Client, LocalCUDACluster, dxgb
-
-
-def _xgb_dask_device_params():
-    """Return GPU parameters for XGBoost's one-process-per-GPU Dask backend."""
-    major_version = int(xgb.__version__.split('.', 1)[0])
-    if major_version >= 2:
-        return {'tree_method': 'hist', 'device': 'cuda'}
-    return {'tree_method': 'gpu_hist'}
-
-
-def _xgb_dask_train(predictors, labels, params, num_boost_round, cuda_devices=None):
-    """Train one distributed XGBoost booster across all visible GPUs."""
-    modules = _dask_cuda_modules()
-    if modules is None:
-        return None
-
-    da, Client, LocalCUDACluster, dxgb = modules
-    cuda_devices = _normalize_cuda_devices(cuda_devices)
-    available_devices = _visible_cuda_devices()
-    n_gpus = len(available_devices) if cuda_devices is None else len(cuda_devices)
-    if n_gpus < 2:
-        return None
-
-    rows_per_chunk = max(1, min(len(labels), 100_000))
-    features = da.from_array(predictors, chunks=(rows_per_chunk, predictors.shape[1]))
-    targets = da.from_array(np.asarray(labels).ravel(), chunks=rows_per_chunk)
-    dask_params = dict(params)
-    dask_params.pop('gpu_id', None)
-    dask_params.pop('predictor', None)
-    dask_params.update(_xgb_dask_device_params())
-
-    cluster_kwargs = {'n_workers': n_gpus, 'threads_per_worker': 1}
-    if cuda_devices is not None:
-        cluster_kwargs['CUDA_VISIBLE_DEVICES'] = cuda_devices
-    with LocalCUDACluster(**cluster_kwargs) as cluster:
-        with Client(cluster) as client:
-            dtrain = dxgb.DaskDMatrix(client, features, targets)
-            result = dxgb.train(
-                client,
-                dask_params,
-                dtrain,
-                num_boost_round=num_boost_round,
-            )
-    return result['booster']
-
-
-def _xgb_dask_predict(predictors, model, cuda_devices=None):
-    """Predict with a trained booster across all visible GPUs when available."""
-    modules = _dask_cuda_modules()
-    if modules is None:
-        return None
-
-    da, Client, LocalCUDACluster, dxgb = modules
-    cuda_devices = _normalize_cuda_devices(cuda_devices)
-    available_devices = _visible_cuda_devices()
-    n_gpus = len(available_devices) if cuda_devices is None else len(cuda_devices)
-    if n_gpus < 2:
-        return None
-
-    rows_per_chunk = max(1, min(predictors.shape[0], 100_000))
-    features = da.from_array(predictors, chunks=(rows_per_chunk, predictors.shape[1]))
-    cluster_kwargs = {'n_workers': n_gpus, 'threads_per_worker': 1}
-    if cuda_devices is not None:
-        cluster_kwargs['CUDA_VISIBLE_DEVICES'] = cuda_devices
-    with LocalCUDACluster(**cluster_kwargs) as cluster:
-        with Client(cluster) as client:
-            predictions = dxgb.predict(client, model, features)
-            return np.asarray(predictions.compute())
-
-def fix_players(pbp):
-    #Add/fix player info for shooters and goaltenders
-
-    #Find players that don't have a handness
-    try:
-        find = pbp.loc[(pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['event_player_1_hand'].isna()),'event_player_1_id'].drop_duplicates().to_list()
-    except:
-        #If this fails then the column doesn't exist and all players are included in the search
-        find = pbp['event_player_1_id'].drop_duplicates().to_list()
-    
-    roster = pd.read_csv(wsba.DEFAULT_ROSTER)
-    roster = roster.loc[roster['player_id'].isin(find)].drop_duplicates(['player_id'])[['player_name','player_id','position','handedness']]
-
-    #Load roster and locate players
-    if not find:
-        pass
-    else:
-        print('Adding player info to pbp...')
-
-        #Some players are missing from the roster file (generally in newer seasons); add these manually
-        miss = pbp.loc[((pbp['event_player_1_id'].isin(find))&(~pbp['event_player_1_id'].isin(roster['player_id']))),'event_player_1_id'].drop_duplicates().dropna().to_list()
-        if miss:
-            add = wsba.nhl_scrape_player_info(miss)[['player_name','player_id','handedness']]
-            roster = pd.concat([roster,add]).reset_index(drop=True)
-
-        #Conversion dict
-        roster['player_id'] = roster['player_id'].astype('Int64')
-        hand_dict = roster.set_index('player_id').to_dict()['handedness']
-
-        #Fix event goalies
-        pbp['event_goalie_id'] = np.where(pbp['event_team_venue']=='away',pbp['home_goalie_id'],pbp['away_goalie_id'])
-            
-        #Add hands
-        pbp['event_player_1_hand'] = pbp['event_player_1_id'].astype('Int64').map(hand_dict).where(lambda x: x.notna(), None)
-    
-    return pbp
-
-def apply_passing_imputation(pbp):
-    #Apply the imputation scheme to estimate player passing (or setting) impacts on shot attempts
-    #The process is described by Micah Blake McCurdy in his xG model writeup
-    #https://hockeyviz.com/txt/xg7#setterImputation
-
-    goals = pbp['event_type'] == 'goal'
-    non_goals = pbp['event_type'].isin(wsba.FENWICK_EVENTS) & (pbp['event_type'] != 'goal')
-
-    #Iterate through each venue and apply to venue on ice players
-    for venue in ['away', 'home']:
-        team_mask = pbp['event_team_venue'] == venue
-        
-        # Get all on-ice player and position columns at once
-        player_cols = [f'{venue}_on_{j}_id' for j in range(1, 7)]
-        pos_cols = [f'{venue}_on_{j}_pos' for j in range(1, 7)]
-        
-        # Initialize all probability columns at once
-        prob_cols = {
-            'primary': [f'{venue}_on_{j}_primary_fenwick_assist_probability' for j in range(1, 7)],
-            'secondary': [f'{venue}_on_{j}_secondary_fenwick_assist_probability' for j in range(1, 7)],
-            'tertiary': [f'{venue}_on_{j}_tertiary_fenwick_assist_probability' for j in range(1, 7)]
-        }
-        
-        for assist_type in prob_cols:
-            pbp[prob_cols[assist_type]] = 0.0
-        
-        # GOALS: Set known assist probabilities
-        goal_team_mask = team_mask & goals
-        
-        # Vectorized assignment for goals
-        for j in range(1, 7):
-            player_col = f'{venue}_on_{j}_id'
-            is_scorer = pbp[player_col] == pbp['event_player_1_id']
-            is_primary_assist = pbp[player_col] == pbp['event_player_2_id']
-            is_secondary_assist = pbp[player_col] == pbp['event_player_3_id']
-            
-            pbp.loc[goal_team_mask & is_primary_assist, f'{venue}_on_{j}_primary_fenwick_assist_probability'] = 1.0
-            pbp.loc[goal_team_mask & is_secondary_assist, f'{venue}_on_{j}_secondary_fenwick_assist_probability'] = 1.0
-        
-        # GOALS: Compute tertiary assist probabilities
-        if goal_team_mask.any():
-            goal_indices = pbp.index[goal_team_mask]
-            goal_on_ice_ids = pbp.loc[goal_indices, player_cols].values
-            goal_on_ice_pos = pbp.loc[goal_indices, pos_cols].values
-            
-            # Map positions to tertiary probabilities
-            tertiary_probs_goals = np.vectorize(lambda pos: wsba.POS_BASE_PROB['tertiary'].get(pos, 0))(goal_on_ice_pos)
-            
-            # Zero out scorer and assist players
-            goal_player_1 = pbp.loc[goal_indices, 'event_player_1_id'].values[:, None]
-            goal_player_2 = pbp.loc[goal_indices, 'event_player_2_id'].values[:, None]
-            goal_player_3 = pbp.loc[goal_indices, 'event_player_3_id'].values[:, None]
-            
-            involved_mask = (
-                (goal_on_ice_ids == goal_player_1) |
-                (goal_on_ice_ids == goal_player_2) |
-                (goal_on_ice_ids == goal_player_3)
-            )
-            tertiary_probs_goals[involved_mask] = 0
-            
-            # Normalize
-            tertiary_sums = tertiary_probs_goals.sum(axis=1, keepdims=True)
-            tertiary_sums[tertiary_sums == 0] = 1
-            tertiary_probs_goals = (tertiary_probs_goals / tertiary_sums) * 0.8
-            
-            # Assign back
-            pbp.loc[goal_indices, prob_cols['tertiary']] = tertiary_probs_goals
-        
-        # NON-GOALS: Compute all assist probabilities
-        if non_goals.any():
-            non_goal_team_mask = team_mask & non_goals
-            non_goal_indices = pbp.index[non_goal_team_mask]
-            
-            on_ice_ids = pbp.loc[non_goal_indices, player_cols].values
-            on_ice_pos = pbp.loc[non_goal_indices, pos_cols].values
-            shooter_ids = pbp.loc[non_goal_indices, 'event_player_1_id'].values[:, None]
-            
-            # Map positions to probabilities for all assist types
-            probs = {}
-            for assist_type in ['primary', 'secondary', 'tertiary']:
-                probs[assist_type] = np.vectorize(lambda pos: wsba.POS_BASE_PROB[assist_type].get(pos, 0))(on_ice_pos)
-                # Zero out shooter
-                probs[assist_type][on_ice_ids == shooter_ids] = 0
-                # Normalize
-                sums = probs[assist_type].sum(axis=1, keepdims=True)
-                sums[sums == 0] = 1
-                probs[assist_type] = (probs[assist_type] / sums) * 0.8
-            
-            # Assign all probabilities at once
-            for assist_type in ['primary', 'secondary', 'tertiary']:
-                pbp.loc[non_goal_indices, prob_cols[assist_type]] = probs[assist_type]
-    
-    return pbp
 
 def apply_time_on_ice(pbp):
-    #Apply time on ice (in shift) for all on-ice skaters and first event player (shooter)
-
-    #Collect on ice columns
-    home_cols = [f'home_on_{i}_id' for i in range(1, 7)]
-    away_cols = [f'away_on_{i}_id' for i in range(1, 7)]
-    pbp = pbp.copy()
-    pbp['_toi_row'] = np.arange(len(pbp))
-    home_long = pbp[['season', 'game_id', 'period', 'seconds_elapsed', '_toi_row'] + home_cols].melt(
-        id_vars=['season', 'game_id', 'period', 'seconds_elapsed', '_toi_row'],
-        value_vars=home_cols,
-        value_name='player_id'
-    )
-    home_long['venue'] = 'home'
-    away_long = pbp[['season', 'game_id', 'period', 'seconds_elapsed', '_toi_row'] + away_cols].melt(
-        id_vars=['season', 'game_id', 'period', 'seconds_elapsed', '_toi_row'],
-        value_vars=away_cols,
-        value_name='player_id'
-    )
-    away_long['venue'] = 'away'
-    on_ice = pd.concat([home_long, away_long], ignore_index=True)
-    on_ice = on_ice.loc[on_ice['player_id'].notna()].sort_values(['season', 'game_id', 'period', 'player_id', '_toi_row'])
-    on_ice['_prev_row'] = on_ice.groupby(['season', 'game_id', 'period', 'player_id'], sort=False)['_toi_row'].shift(1)
-    on_ice['_new_shift'] = (on_ice['_prev_row'].isna() | (on_ice['_toi_row'] != on_ice['_prev_row'] + 1)).astype(int)
-    on_ice['_shift_id'] = on_ice.groupby(['season', 'game_id', 'period', 'player_id'], sort=False)['_new_shift'].cumsum()
-    on_ice['_shift_start'] = on_ice.groupby(['season', 'game_id', 'period', 'player_id', '_shift_id'], sort=False)['seconds_elapsed'].transform('first')
-    on_ice['shift_time_on_ice'] = on_ice['seconds_elapsed'] - on_ice['_shift_start']
-
-    #Shooter
-    shooter_col = 'event_player_1_shift_time_on_ice'
-    shooter_toi = on_ice[['_toi_row', 'player_id', 'shift_time_on_ice']].merge(
-        pbp[['_toi_row', 'event_player_1_id']],
-        left_on=['_toi_row', 'player_id'],
-        right_on=['_toi_row', 'event_player_1_id'],
-        how='inner'
-    )[['_toi_row', 'shift_time_on_ice']]
-    pbp = pbp.merge(shooter_toi.rename(columns={'shift_time_on_ice': shooter_col}), on='_toi_row', how='left')
-
-    #Opponent TOI
-    event_venue = pbp[['_toi_row', 'event_team_venue']]
-    against = on_ice[['_toi_row', 'venue', 'shift_time_on_ice']].merge(event_venue, on='_toi_row', how='left')
-    against = against.loc[
-        ((against['event_team_venue'] == 'away') & (against['venue'] == 'home')) |
-        ((against['event_team_venue'] == 'home') & (against['venue'] == 'away'))
+    toi = [
+        "event_player_1_shift_time_on_ice",
+        "event_on_ice_against_min_shift_time_on_ice",
+        "event_on_ice_against_avg_shift_time_on_ice",
+        "event_on_ice_against_max_shift_time_on_ice",
     ]
-    against = against.groupby('_toi_row', as_index=False)['shift_time_on_ice'].agg(
-        event_on_ice_against_min_shift_time_on_ice='min',
-        event_on_ice_against_avg_shift_time_on_ice='mean',
-        event_on_ice_against_max_shift_time_on_ice='max'
+    home = [f"home_on_{i}_id" for i in range(1, 7)]
+    away = [f"away_on_{i}_id" for i in range(1, 7)]
+    pbp = pbp.drop(["_toi_row", *toi], strict=False).with_columns([
+        pl.col("event_player_1_id").cast(pl.Int64, strict=False),
+        *[pl.col(c).cast(pl.Int64, strict=False) for c in home + away],
+    ]).with_row_index("_toi_row")
+    ids = ["season", "game_id", "period", "seconds_elapsed", "_toi_row"]
+    long = pl.concat([
+        pbp.select(ids + home).unpivot(on=home, index=ids, variable_name="position", value_name="player_id").with_columns(pl.lit("home").alias("venue")),
+        pbp.select(ids + away).unpivot(on=away, index=ids, variable_name="position", value_name="player_id").with_columns(pl.lit("away").alias("venue")),
+    ], how="vertical_relaxed").filter(pl.col("player_id").is_not_null()).sort(["season", "game_id", "period", "player_id", "_toi_row"])
+    player_group = ["season", "game_id", "period", "player_id"]
+    long = long.with_columns(pl.col("_toi_row").shift(1).over(player_group).alias("_prev_row")).with_columns(
+        (pl.col("_prev_row").is_null() | (pl.col("_toi_row") != pl.col("_prev_row") + 1)).cast(pl.Int64).alias("_new_shift")
+    ).with_columns(pl.col("_new_shift").cum_sum().over(player_group).alias("_shift_id"))
+    shift_group = player_group + ["_shift_id"]
+    long = long.with_columns(pl.col("seconds_elapsed").first().over(shift_group).alias("_shift_start")).with_columns(
+        (pl.col("seconds_elapsed") - pl.col("_shift_start")).alias("shift_time_on_ice")
     )
-    pbp = pbp.merge(against, on='_toi_row', how='left')
-    pbp = pbp.drop(columns=['_toi_row'])
+    shooter = long.select(["_toi_row", "player_id", "shift_time_on_ice"]).join(
+        pbp.select(["_toi_row", "event_player_1_id"]),
+        left_on=["_toi_row", "player_id"], right_on=["_toi_row", "event_player_1_id"], how="inner",
+    ).select(["_toi_row", pl.col("shift_time_on_ice").alias(toi[0])])
+    pbp = pbp.join(shooter, on="_toi_row", how="left")
+    against = long.select(["_toi_row", "venue", "shift_time_on_ice"]).join(
+        pbp.select(["_toi_row", "event_team_venue"]), on="_toi_row", how="left"
+    ).filter(
+        ((pl.col("event_team_venue") == "away") & (pl.col("venue") == "home"))
+        | ((pl.col("event_team_venue") == "home") & (pl.col("venue") == "away"))
+    ).group_by("_toi_row").agg([
+        pl.col("shift_time_on_ice").min().alias(toi[1]),
+        pl.col("shift_time_on_ice").mean().alias(toi[2]),
+        pl.col("shift_time_on_ice").max().alias(toi[3]),
+    ])
+    return pbp.join(against, on="_toi_row", how="left").drop("_toi_row")
 
-    return pbp
-        
+
 def prep_xG_data(pbp):
-    #Prep data for xG training and calculation
-    pbp = fix_players(pbp)
-
-    #Informal groupby
-    pbp = pbp.sort_values(by=['season','game_id','period','seconds_elapsed','event_num'])
-    shift_group = pbp.groupby(['season', 'game_id', 'period'], sort=False)
-
-    #Recalibrate times series data with current data
-    pbp['seconds_since_last'] = pbp['seconds_elapsed'] - shift_group['seconds_elapsed'].shift(1)
-    pbp["seconds_since_last"] = pbp["seconds_since_last"].fillna(0)
-
-    #Create last event columns
-    pbp["event_team_last"] = shift_group['event_team_abbr'].shift(1)
-    pbp["event_type_last"] = shift_group['event_type'].shift(1)
-    pbp["x_adj_last"] = shift_group['x_adj'].shift(1)
-    pbp["y_adj_last"] = shift_group['y_adj'].shift(1)
-    pbp["zone_code_last"] = shift_group['zone_code'].shift(1)
-
-    pbp = pbp.sort_values(['season','game_id','period','seconds_elapsed','event_num'])    
-
-    #Contextual Data (for score state minimize the capture to four goals)
-    pbp['score_state'] = np.where(pbp['away_team_abbr']==pbp['event_team_abbr'],pbp['away_score']-pbp['home_score'],pbp['home_score']-pbp['away_score'])
-    pbp['score_state'] = np.where(pbp['score_state']>4,4,pbp['score_state'])
-    pbp['score_state'] = np.where(pbp['score_state']<-4,-4,pbp['score_state'])
-
-    pbp['strength_diff'] = np.where(pbp['away_team_abbr']==pbp['event_team_abbr'],pbp['away_skaters']-pbp['home_skaters'],pbp['home_skaters']-pbp['away_skaters'])
-    pbp['strength_state_venue'] = pbp['away_skaters'].astype(str)+'v'+pbp['home_skaters'].astype(str)
-    pbp['distance_from_last'] = np.sqrt((pbp['x_adj'] - pbp['x_adj_last'])**2 + (pbp['y_adj'] - pbp['y_adj_last'])**2)
-    pbp['angle_from_last'] = np.degrees(np.arctan2(abs(pbp['y_adj'] - pbp['y_adj_last']), abs(89 - (pbp['x_adj']-pbp['x_adj_last']))))
-
-    #Event speeds
-    pbp['speed_from_last'] = np.where(pbp['seconds_since_last']==0,0,pbp['distance_from_last']/pbp['seconds_since_last'])
-    pbp['speed_of_angle_from_last'] = np.where(pbp['seconds_since_last']==0,0,pbp['angle_from_last']/pbp['seconds_since_last'])
-
-    #Rush, in-zone, and rebound shots are labelled
-    pbp['rush'] = np.where((pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['zone_code_last'].isin(['N','D']))&(pbp['zone_code']=='O')&(pbp['seconds_since_last']<=5),1,0)
-    pbp['in_zone'] = np.where((pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['zone_code_last']=='O')&(pbp['zone_code']=='O')&(pbp['seconds_since_last']<=5),1,0)
-    pbp['rebound'] = np.where((pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['event_type_last'].isin(wsba.FENWICK_EVENTS))&(pbp['seconds_since_last']<=2),1,0)
-
-    #Create boolean variables
-    pbp["is_goal"]=(pbp['event_type']=='goal').astype(int)
-    pbp["is_home"]=(pbp['home_team_abbr']==pbp['event_team_abbr']).astype(int)
-
-    #Boolean variables for shot types and prior events
+    frame, was_pandas = _as_polars(pbp)
+    frame = fix_players(frame)
+    order = ["season", "game_id", "period", "seconds_elapsed", "event_num"]
+    groups = ["season", "game_id", "period"]
+    frame = frame.sort(order).with_columns(
+        (pl.col("seconds_elapsed") - pl.col("seconds_elapsed").shift(1).over(groups)).fill_null(0).alias("seconds_since_last")
+    ).with_columns([
+        pl.col("event_team_abbr").shift(1).over(groups).alias("event_team_last"),
+        pl.col("event_type").shift(1).over(groups).alias("event_type_last"),
+        pl.col("x_adj").shift(1).over(groups).alias("x_adj_last"),
+        pl.col("y_adj").shift(1).over(groups).alias("y_adj_last"),
+        pl.col("zone_code").shift(1).over(groups).alias("zone_code_last"),
+    ]).with_columns([
+        pl.when(pl.col("away_team_abbr") == pl.col("event_team_abbr")).then(pl.col("away_score") - pl.col("home_score")).otherwise(pl.col("home_score") - pl.col("away_score")).clip(-4, 4).alias("score_state"),
+        pl.when(pl.col("away_team_abbr") == pl.col("event_team_abbr")).then(pl.col("away_skaters") - pl.col("home_skaters")).otherwise(pl.col("home_skaters") - pl.col("away_skaters")).alias("strength_diff"),
+        (pl.col("away_skaters").cast(pl.String) + pl.lit("v") + pl.col("home_skaters").cast(pl.String)).alias("strength_state_venue"),
+        ((pl.col("x_adj") - pl.col("x_adj_last")).pow(2) + (pl.col("y_adj") - pl.col("y_adj_last")).pow(2)).sqrt().alias("distance_from_last"),
+        pl.arctan2d((pl.col("y_adj") - pl.col("y_adj_last")).abs(), (89 - (pl.col("x_adj") - pl.col("x_adj_last"))).abs()).alias("angle_from_last"),
+    ]).with_columns([
+        pl.when(pl.col("seconds_since_last") == 0).then(0.0).when(pl.col("distance_from_last").is_null() | pl.col("seconds_since_last").is_null()).then(None).otherwise(pl.col("distance_from_last") / pl.col("seconds_since_last")).alias("speed_from_last"),
+        pl.when(pl.col("seconds_since_last") == 0).then(0.0).when(pl.col("angle_from_last").is_null() | pl.col("seconds_since_last").is_null()).then(None).otherwise(pl.col("angle_from_last") / pl.col("seconds_since_last")).alias("speed_of_angle_from_last"),
+    ])
+    fenwick = pl.col("event_type").is_in(wsba.FENWICK_EVENTS)
+    frame = frame.with_columns([
+        pl.when(fenwick & pl.col("zone_code_last").is_in(["N", "D"]) & (pl.col("zone_code") == "O") & (pl.col("seconds_since_last") <= 5)).then(1).otherwise(0).alias("rush"),
+        pl.when(fenwick & (pl.col("zone_code_last") == "O") & (pl.col("zone_code") == "O") & (pl.col("seconds_since_last") <= 5)).then(1).otherwise(0).alias("in_zone"),
+        pl.when(fenwick & pl.col("event_type_last").is_in(wsba.FENWICK_EVENTS) & (pl.col("seconds_since_last") <= 2)).then(1).otherwise(0).alias("rebound"),
+        (pl.col("event_type") == "goal").fill_null(False).cast(pl.Int64).alias("is_goal"),
+        (pl.col("home_team_abbr") == pl.col("event_team_abbr")).fill_null(False).cast(pl.Int64).alias("is_home"),
+    ])
     for shot in wsba.SHOT_TYPES:
-        pbp[shot] = (pbp['shot_type']==shot).astype(int)
+        frame = frame.with_columns((pl.col("shot_type") == shot).fill_null(False).cast(pl.Int64).alias(shot))
     for event in wsba.EVENTS[:-1]:
-        pbp[f'prior_{event}'] = (pbp['event_type_last']==event).astype(int)
-
-    pbp['other-shot'] = (~pbp['shot_type'].isin(wsba.SHOT_TYPES)).astype(int)
-    pbp['prior_same'] = (pbp['event_team_last']==pbp['event_team_abbr']).astype(int)
-    
-    #Strength boolean (used instead of 'strength_diff' in order to more usefully distinguish between strength states)
+        frame = frame.with_columns((pl.col("event_type_last") == event).fill_null(False).cast(pl.Int64).alias(f"prior_{event}"))
+    frame = frame.with_columns([
+        (~pl.col("shot_type").is_in(wsba.SHOT_TYPES)).fill_null(True).cast(pl.Int64).alias("other-shot"),
+        (pl.col("event_team_last") == pl.col("event_team_abbr")).fill_null(False).cast(pl.Int64).alias("prior_same"),
+    ])
     for strength in wsba.STRENGTHS:
-        pbp[f'strength_{strength}'] = (pbp['strength_state']==strength).astype(int)
-    
-    #Flag special shot attempts added after 2021
-    pbp['short'] = (pbp['event_reason']=='short').astype(int)
-    pbp['failed_bank'] = (pbp['event_reason']=='failed-bank-attempt').astype(int)
+        frame = frame.with_columns((pl.col("strength_state") == strength).fill_null(False).cast(pl.Int64).alias(f"strength_{strength}"))
+    frame = frame.with_columns([
+        (pl.col("event_reason") == "short").fill_null(False).cast(pl.Int64).alias("short"),
+        (pl.col("event_reason") == "failed-bank-attempt").fill_null(False).cast(pl.Int64).alias("failed_bank"),
+        (pl.col("y_adj_last") * pl.col("y_adj") < 0).fill_null(False).cast(pl.Int64).alias("cross_ice"),
+        pl.when(fenwick & pl.col("event_goalie_id").is_null()).then(1).otherwise(0).alias("empty_net"),
+        pl.when(((pl.col("y_adj") < 0) & (pl.col("event_player_1_hand") == "L")) | ((pl.col("y_adj") >= 0) & (pl.col("event_player_1_hand") == "R"))).then(1).otherwise(0).alias("offwing"),
+    ])
+    frame = apply_time_on_ice(frame)
+    return pd.DataFrame(frame.to_dicts()) if was_pandas else frame
 
-    #Determine if the current play occured on the opposite side of the ice from the previous event
-    pbp['cross_ice'] = (pbp['y_adj_last'] * pbp['y_adj'] < 0).astype(int)
 
-    #Misc variables
-    pbp['empty_net'] = np.where((pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['event_goalie_id'].isna()),1,0)
-    pbp['offwing'] = np.where(((pbp['y_adj']<0)&(pbp['event_player_1_hand']=='L'))|((pbp['y_adj']>=0)&(pbp['event_player_1_hand']=='R')),1,0)
-    
-    #Add shot assist probabilities
-    pbp = apply_passing_imputation(pbp)
+def prepare_xG_shots(pbp):
+    frame, _ = _as_polars(pbp)
+    if "event_index" not in frame.columns:
+        frame = frame.with_row_index("event_index")
+    candidate = frame.filter(
+        pl.col("event_type").is_in(wsba.EVENTS)
+        & pl.col("strength_state").is_in(wsba.STRENGTHS)
+        & pl.col("event_distance").is_not_null()
+        & pl.col("event_angle").is_not_null()
+    )
+    return prep_xG_data(candidate).filter(pl.col("event_type").is_in(wsba.FENWICK_EVENTS))
 
-    #Return: pbp data prepared to train and calculate the xG model
-    return pbp
 
-def wsba_xG(pbp, model_type: Literal['bayesian', 'frequentist'] = 'frequentist', states = False, hypertune = False, train = False, test_path = wsba.TEST_PATH, cv_path = wsba.CV_PATH, model_path = wsba.XG_MODEL, train_runs = 20, cv_runs = 20, strengths = None, empty_net = False, cuda: Optional[bool] = None, cuda_devices: Optional[Union[int, Sequence[int]]] = None):
-    #Train and calculate the WSBA Expected Goals model
-
-    cuda = _resolve_cuda(cuda)
-    cuda_devices = _normalize_cuda_devices(cuda_devices)
-    xgb_device_params = _xgb_device_params(cuda, cuda_devices)
-    visible_cuda_devices = _visible_cuda_devices() if cuda else []
-    requested_cuda_devices = visible_cuda_devices if cuda_devices is None else cuda_devices
-    multi_gpu_requested = bool(cuda and len(requested_cuda_devices) > 1)
-    if cuda:
-        selected_device = 0 if cuda_devices is None else cuda_devices[0]
-        print(f'CUDA enabled for XGBoost on device {selected_device}.')
-    if multi_gpu_requested:
-        print(f'Multi-GPU training requested across {len(requested_cuda_devices)} visible devices.')
-        if _dask_cuda_modules() is None:
-            warnings.warn(
-                'Dask CUDA is not installed; falling back to the selected XGBoost GPU.',
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    
-    #Add index for future merging
-    pbp['event_index'] = pbp.index
-
-    #Initialize xG column for all events
-    pbp['xG'] = 0.0
-
-    #Recalibrate coordinates
-    pbp = adjust_coords(pbp)
-
-    #Recalculate stat states if speciifed
-    if states:
-        for venue in ['away','home']:
-            pbp[f'{venue}_score'] = ((pbp['event_team_venue']==venue)&(pbp['event_type']=='goal')).groupby(pbp['game_id']).cumsum().groupby(pbp['game_id']).shift(1).fillna(0)
-            pbp[f'{venue}_corsi'] = ((pbp['event_team_venue']==venue)&(pbp['event_type'].isin(['blocked-shot','missed-shot','shot-on-goal','goal']))).groupby(pbp['game_id']).cumsum().groupby(pbp['game_id']).shift(1).fillna(0)
-            pbp[f'{venue}_fenwick'] = ((pbp['event_team_venue']==venue)&(pbp['event_type'].isin(['missed-shot','shot-on-goal','goal']))).groupby(pbp['game_id']).cumsum().groupby(pbp['game_id']).shift(1).fillna(0)
-            pbp[f'{venue}_penalties'] = ((pbp['event_team_venue']==venue)&(pbp['event_type']=='penalty')).groupby(pbp['game_id']).cumsum().groupby(pbp['game_id']).shift(1).fillna(0)
-
-    #Fix strengths
-    pbp['strength_state'] = np.where((pbp['season_type']==3)&(pbp['period']>4),
-                                    (np.where(pbp['event_team_abbr']==pbp['away_team_abbr'],
-                                            pbp['away_skaters'].astype(str)+"v"+pbp['home_skaters'].astype(str),
-                                            pbp['home_skaters'].astype(str)+"v"+pbp['away_skaters'].astype(str))),
-                                    pbp['strength_state'])
-    pbp = pbp.sort_values(by=['season','game_id','period','seconds_elapsed','event_num'])
-
-    #Prep data and filter shot events
-    data = prep_xG_data(pbp.loc[(pbp['event_type'].isin(wsba.EVENTS))&(pbp['strength_state'].isin(wsba.STRENGTHS))&(pbp['x'].notna())&(pbp['y'].notna())])
-    data = data.loc[data['event_type'].isin(wsba.FENWICK_EVENTS)]
+def wsba_xG(
+    pbp, features=FEATURES, target=TARGET, tune_path=None, cv_path=None,
+    model_path=None, tune_runs=20, cv_runs=20, strengths=None, empty_net=False,
+    gpu=None, hypertune=True, hyperparameters=None, tune_parameters=None,
+    parameter_space=None,
+):
+    frame, _ = _as_polars(pbp)
+    feature_names = list(dict.fromkeys(features))
+    manual = dict(hyperparameters or {})
+    space = parameter_space or HYPERPARAMETER_SPACE
+    tuned = list(TUNED_HYPERPARAMETERS if tune_parameters is None else tune_parameters)
+    unknown = [name for name in tuned if name not in space]
+    if unknown:
+        raise ValueError(f"Unknown tuning parameters: {unknown}")
     if strengths is not None:
-        data = data.loc[data['strength_state'].isin(strengths)]
-    data = data.loc[data['empty_net'] == int(empty_net)]
-    
-    if model_type == 'bayesian':
-        NotImplementedError('PyMC Model in Development...')
+        frame = frame.filter(pl.col("strength_state").is_in(strengths))
+    frame = frame.filter((pl.col("empty_net") == int(empty_net)) & pl.col(target).is_not_null())
+    print(f"Training population: {frame.height:,} rows across {frame.get_column('game_id').n_unique():,} games")
+    missing = [column for column in [target, *feature_names] if column not in frame.columns]
+    if missing:
+        raise ValueError(f"Missing model columns: {missing}")
+    data = frame.select([target, *feature_names]).with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in [target, *feature_names]])
+    feature_names = [c for c in feature_names if (data.get_column(c).fill_null(0) != 0).any()]
+    data = data.select([target, *feature_names])
+    sparse = sp.csr_matrix(data.fill_null(float("nan")).to_numpy())
+    labels = sparse[:, 0].toarray().ravel()
+    predictors = sparse[:, 1:]
+    build_info = getattr(xgb, "build_info", lambda: {})()
+    gpu = torch.cuda.is_available() and str(build_info.get("USE_CUDA", "")).upper() in {"ON", "TRUE", "1"} if gpu is None else bool(gpu)
+    device = {"tree_method": "hist", "device": "cuda" if gpu else "cpu"}
+    base = {"objective": "binary:logistic", "eval_metric": ["logloss", "auc"], **device, **manual}
+    fixed_seed = manual.get("seed")
+    dtrain = xgb.DMatrix(predictors, label=labels, feature_names=feature_names)
+    groups = frame.get_column("game_id").to_numpy()
+    folds = list(GroupKFold(n_splits=min(10, len(np.unique(groups)))).split(predictors, labels, groups=groups))
+    print("Tuning parameters:", tuned)
+    print("Manual parameter overrides:", manual)
+    print("Search space:", space)
+    if hypertune:
+        tuning = []
+        print("### HYPERTUNING ###")
+        for i in range(tune_runs):
+            print(f"## LOOP: {i + 1} ##")
+            values = {name: manual[name] if name in manual else _sample_parameter(name, space) if name in tuned else spec["default"] for name, spec in space.items()}
+            seed = int(fixed_seed if fixed_seed is not None else np.random.randint(0, 10000))
+            params = {**base, **values, "seed": seed}
+            cv = pl.from_pandas(xgb.cv(params=params, dtrain=dtrain, num_boost_round=1000, folds=folds, early_stopping_rounds=25, metrics=["logloss", "auc"], seed=seed))
+            ll = cv["test-logloss-mean"].arg_min()
+            auc = cv["test-auc-mean"].arg_max()
+            tuning.append({"trial": i + 1, "n_rows": frame.height, "n_games": frame.get_column("game_id").n_unique(), **_export_parameters(params), "LL": float(cv["test-logloss-mean"][ll]), "LL_rounds": int(ll + 1), "AUC": float(cv["test-auc-mean"][auc]), "AUC_rounds": int(auc + 1)})
+        tuning = pl.DataFrame(tuning).sort("AUC", descending=True)
+        if tune_path is not None:
+            Path(tune_path).parent.mkdir(parents=True, exist_ok=True)
+            tuning.write_csv(tune_path)
+        best = tuning.row(0, named=True)
+        params_grid = {**base, **{name: best[name] for name in space}}
+        for name, spec in space.items():
+            if spec["kind"] == "int":
+                params_grid[name] = int(params_grid[name])
+        cv_rows = []
+        print("### CROSS-VALIDATION ###")
+        for i in range(cv_runs):
+            print(f"## LOOP: {i + 1} ##")
+            seed = int(fixed_seed if fixed_seed is not None else np.random.randint(0, 10000))
+            params = {**params_grid, "seed": seed}
+            cv = pl.from_pandas(xgb.cv(params=params, dtrain=dtrain, num_boost_round=1000, folds=folds, early_stopping_rounds=25, metrics=["logloss", "auc"], seed=seed))
+            auc = cv["test-auc-mean"].arg_max()
+            ll = cv["test-logloss-mean"].arg_min()
+            cv_rows.append({"run": i + 1, "n_rows": frame.height, "n_games": frame.get_column("game_id").n_unique(), **_export_parameters(params), "AUC_rounds": int(auc + 1), "AUC": float(cv["test-auc-mean"][auc]), "LL_rounds": int(ll + 1), "LL": float(cv["test-logloss-mean"][ll])})
+        cv_final = pl.DataFrame(cv_rows).sort("AUC", descending=True)
+        if cv_path is not None:
+            Path(cv_path).parent.mkdir(parents=True, exist_ok=True)
+            cv_final.write_csv(cv_path)
     else:
-        training = data.copy()
-        if training.empty:
-            return None if train else pbp.sort_values(by=['game_id','period','seconds_elapsed','event_num'])
+        if tune_path is None or cv_path is None:
+            raise ValueError("tune_path and cv_path are required when hypertune=False")
+        best = pl.read_csv(tune_path).row(0, named=True)
+        cv_final = pl.read_csv(cv_path)
+        params_grid = {**base, **{name: best.get(name, spec["default"]) for name, spec in space.items()}}
+        params_grid.update(manual)
+        for name, spec in space.items():
+            if spec["kind"] == "int":
+                params_grid[name] = int(params_grid[name])
+    seed = int(cv_final.get_column("seed").item(0))
+    rounds = int(cv_final.get_column("AUC_rounds").item(0)) + (0 if "run" in cv_final.columns else 1)
+    final_params = {**params_grid, "seed": seed}
+    print("Training model...")
+    print("Selected params:")
+    print(final_params)
+    model = xgb.train(final_params, dtrain, num_boost_round=rounds, verbose_eval=2)
+    model_path = Path(model_path or MODEL_DIR / "wsba_xg_model.json")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model.save_model(str(model_path))
+    model_path.with_name(model_path.stem + "_features.json").write_text(json.dumps(feature_names, indent=2))
+    return model
 
-        #Convert to sparse
-        feature_names = [
-            col for col in wsba.CONTINUOUS + wsba.BOOLEAN
-            if training[col].notna().any() and not training[col].fillna(0).eq(0).all()
-        ]
-        data_sparse = sp.csr_matrix(training[[wsba.TARGET] + feature_names])
-        is_goal_vect = data_sparse[:,0].toarray()
-        predictors = data_sparse[:,1:]
 
-        #XGB DataModel
-        xgb_matrix = xgb.DMatrix(data=predictors,label=is_goal_vect,feature_names=feature_names)
+def _model_features(model, model_path):
+    sidecar = Path(model_path).with_name(Path(model_path).stem + "_features.json")
+    if sidecar.exists():
+        return json.loads(sidecar.read_text())
+    return model.feature_names or list(FEATURES)
 
-        if train:
-            print('### XGBOOST MODEL TRAINING ###')
-            groups = training['game_id'].to_numpy()
-            folds = list(GroupKFold(n_splits=min(10, len(pd.unique(groups)))).split(predictors, is_goal_vect.ravel(), groups=groups))
-            if hypertune:
-                # DataFrames to store results
-                best_df = pd.DataFrame(columns=["max_depth", "eta", "gamma", "subsample", "colsample_bytree", "min_child_weight", "max_delta_step"])
-                best_ll = pd.DataFrame(columns=["ll", "ll_rounds", "auc", "auc_rounds", "seed"])
 
-                print('### HYPERTUNING ###')
-                for i in range(train_runs):
-                    print(f"## LOOP: {i+1} ##")
-                    param = {
-                        "objective": "binary:logistic",
-                        "eval_metric": ["logloss", "auc"],
-                        "max_depth": 6,
-                        "eta": np.random.uniform(0.06, 0.11),
-                        "gamma": np.random.uniform(0.06, 0.12),
-                        "subsample": np.random.uniform(0.76, 0.84),
-                        "colsample_bytree": np.random.uniform(0.76, 0.8),
-                        "min_child_weight": np.random.randint(5, 23),
-                        "max_delta_step": np.random.randint(4, 9),
-                        **xgb_device_params,
-                    }
-                    seed = np.random.randint(0, 10000)
-                    np.random.seed(seed)
-                    cv_results = xgb.cv(
-                        params=param,
-                        dtrain=xgb_matrix,
-                        num_boost_round=1000,
-                        folds=folds,
-                        early_stopping_rounds=25,
-                        metrics=["logloss", "auc"],
-                        seed=seed
-                    )
-                    best_df.loc[i] = param
-                    best_ll.loc[i] = [
-                        cv_results["test-logloss-mean"].min(),
-                        cv_results["test-logloss-mean"].idxmin(),
-                        cv_results["test-auc-mean"].max(),
-                        cv_results["test-auc-mean"].idxmax(),
-                        seed
-                    ]
+def score_xG_models(shots, model_dir=MODEL_DIR, model_names=None):
+    frame, _ = _as_polars(shots)
+    output = frame.select(["event_index"]).clone()
+    columns = []
+    names = list(MODEL_STRENGTHS if model_names is None else model_names)
+    for name in names:
+        strengths = MODEL_STRENGTHS[name]
+        model_data = frame.filter(pl.col("strength_state").is_in(strengths) & (pl.col("empty_net") == int(name == "en")))
+        if model_data.is_empty():
+            continue
+        model_path = Path(model_dir) / f"wsba_xg_model_{name}.json"
+        model = xgb.Booster()
+        model.load_model(str(model_path))
+        model_features = _model_features(model, model_path)
+        missing = [feature for feature in model_features if feature not in model_data.columns]
+        if missing:
+            model_data = model_data.with_columns([pl.lit(None).cast(pl.Float32).alias(feature) for feature in missing])
+        matrix = sp.csr_matrix(model_data.select(model_features).fill_null(float("nan")).to_numpy().astype(np.float32, copy=False))
+        column = f"xG_{name}"
+        columns.append(column)
+        predictions = np.clip(model.predict(xgb.DMatrix(matrix, feature_names=model_features)), 0.0, 1.0)
+        output = output.join(pl.DataFrame({"event_index": model_data["event_index"], column: predictions}), on="event_index", how="left")
+    return output.with_columns(pl.coalesce([pl.col(column) for column in columns]).alias("wsba_xg")) if columns else output.with_columns(pl.lit(None).cast(pl.Float32).alias("wsba_xg"))
 
-                best_all = pd.concat([best_df, best_ll], axis=1).dropna().sort_values(by="auc", ascending=False)
-                best_all.to_csv(test_path,index=False)
-                params_grid = {
-                    "objective": "binary:logistic",
-                    "eval_metric": ["logloss", "auc"],
-                    "eta": best_all['eta'].iloc[0],
-                    "gamma": best_all['gamma'].iloc[0],
-                    "subsample": best_all['subsample'].iloc[0],
-                    "max_depth": int(best_all['max_depth'].iloc[0]),
-                    "colsample_bytree": best_all['colsample_bytree'].iloc[0],
-                    "min_child_weight": int(best_all['min_child_weight'].iloc[0]),
-                    "max_delta_step": int(best_all['max_delta_step'].iloc[0]),
-                    **xgb_device_params,
-                }
 
-                cv_test = pd.DataFrame(columns=["AUC_rounds", "AUC", "LL_rounds", "LL", "seed"])
-                print('### CROSS-VALIDATION ###')
-                for i in range(cv_runs):
-                    print(f"## LOOP: {i+1} ##")
-                    seed = np.random.randint(0, 10000)
-                    np.random.seed(seed)
-                    cv_rounds = xgb.cv(
-                        params=params_grid,
-                        dtrain=xgb_matrix,
-                        num_boost_round=1000,
-                        folds=folds,
-                        early_stopping_rounds=25,
-                        metrics=["logloss", "auc"],
-                        seed=seed
-                    )
-                    cv_test.loc[i] = [
-                        cv_rounds["test-auc-mean"].idxmax(),
-                        cv_rounds["test-auc-mean"].max(),
-                        cv_rounds["test-logloss-mean"].idxmin(),
-                        cv_rounds["test-logloss-mean"].min(),
-                        seed,
-                    ]
+def evaluate_xG_models(shots, model_dir=MODEL_DIR, plot_dir=XG_MODEL_DIR, model_names=None):
+    """Run the notebook's results tasks on one shared prepared PBP frame."""
+    import matplotlib.pyplot as plt
+    from sklearn.calibration import calibration_curve
+    from sklearn.metrics import (
+        auc,
+        average_precision_score,
+        brier_score_loss,
+        log_loss,
+        roc_auc_score,
+        roc_curve,
+    )
 
-                cv_final = cv_test.sort_values(by="AUC", ascending=False)
-                cv_final.to_csv(cv_path,index=False)
-            else:
-                # Load previous parameters
-                best_all = pd.read_csv(test_path)
-                cv_final = pd.read_csv(cv_path)
+    frame, _ = _as_polars(shots)
+    names = list(MODEL_STRENGTHS if model_names is None else model_names)
+    scored = frame.join(score_xG_models(frame, model_dir=model_dir, model_names=names), on="event_index", how="left")
+    output_metrics = {}
 
-                print('Loaded hyperparameters...')
-                # Final parameters
-                params_grid = {
-                    "objective": "binary:logistic",
-                    "eval_metric": ["logloss", "auc"],
-                    "eta": best_all['eta'].iloc[0],
-                    "gamma": best_all['gamma'].iloc[0],
-                    "subsample": best_all['subsample'].iloc[0],
-                    "max_depth": int(best_all['max_depth'].iloc[0]),
-                    "colsample_bytree": best_all['colsample_bytree'].iloc[0],
-                    "min_child_weight": int(best_all['min_child_weight'].iloc[0]),
-                    "max_delta_step": int(best_all['max_delta_step'].iloc[0]),
-                    **xgb_device_params,
-                }
-
-            print('Training model...')
-            seed = int(cv_final['seed'].iloc[0])
-            np.random.seed(seed)
-            model = None
-            if multi_gpu_requested:
-                try:
-                    model = _xgb_dask_train(
-                        predictors,
-                        is_goal_vect,
-                        params_grid,
-                        int(cv_final['AUC_rounds'].iloc[0]),
-                        cuda_devices=cuda_devices,
-                    )
-                except Exception as exc:
-                    warnings.warn(
-                        f'Multi-GPU XGBoost training failed ({exc}); falling back to a single GPU.',
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-            if model is None:
-                model = xgb.train(
-                    params=params_grid,
-                    dtrain=xgb_matrix,
-                    num_boost_round=int(cv_final['AUC_rounds'].iloc[0]),
-                    verbose_eval=2,
-                )
-            
-            #Save model
-            model.save_model(model_path)
-            with open(model_path.replace('.json', '_features.json'), 'w') as f:
-                json_lib.dump(feature_names, f)
-            
-        else:
-            #Load model
-            model = xgb.Booster()
-            model.load_model(model_path)
-            predictions = None
-            if multi_gpu_requested:
-                try:
-                    predictions = _xgb_dask_predict(predictors, model, cuda_devices=cuda_devices)
-                except Exception as exc:
-                    warnings.warn(
-                        f'Multi-GPU XGBoost prediction failed ({exc}); falling back to a single GPU.',
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-            if predictions is None:
-                if xgb_device_params:
-                    model.set_param(xgb_device_params)
-                predictions = model.predict(xgb_matrix)
-            training['xG'] = predictions
-            xg_data = training
-
-            #Add xG columns
-            for col in xg_data.columns:
-                if col not in pbp.columns:
-                    pbp[col] = np.nan
-                    pbp[col] = pbp[col].astype('object')
-
-            pbp.loc[xg_data.index, xg_data.columns] = xg_data
-
-            #Return: PBP dataframe with xG columns
-            pbp_xg = pbp.sort_values(by=['game_id','period','seconds_elapsed','event_num'])
-
-            return pbp_xg
-
-def feature_importance(model_path = wsba.XG_MODEL, metric_path = wsba.METRIC_PATH):
-    print('Feature importance for WSBA xG Model...')
-
-    model_dir = os.path.dirname(model_path)
-    model_paths = {
-        'ev': os.path.join(model_dir, 'wsba_xg_ev.json'),
-        'pp': os.path.join(model_dir, 'wsba_xg_pp.json'),
-        'pk': os.path.join(model_dir, 'wsba_xg_pk.json'),
-        'en': os.path.join(model_dir, 'wsba_xg_en.json'),
-    }
-    if not all(os.path.exists(path) for path in model_paths.values()):
-        model_paths = {
-            'all': model_path,
-            'en': model_path.replace('.json', '_en.json')
+    def metrics_for(data, prediction_column):
+        data = data.filter(pl.col(prediction_column).is_not_null())
+        y = data.get_column(TARGET).to_numpy().astype(np.int8, copy=False)
+        predictions = data.get_column(prediction_column).to_numpy()
+        fpr, tpr, _ = roc_curve(y, predictions)
+        return {
+            "n_rows": int(data.height),
+            "n_goals": int(y.sum()),
+            "n_games": int(data.get_column("game_id").n_unique()),
+            "roc_auc": float(roc_auc_score(y, predictions)),
+            "pr_auc": float(average_precision_score(y, predictions)),
+            "log_loss": float(log_loss(y, predictions, labels=[0, 1])),
+            "brier_score": float(brier_score_loss(y, predictions)),
+            "total_xg": float(predictions.sum()),
+            "min_xg": float(predictions.min()),
+            "max_xg": float(predictions.max()),
+            "roc_auc_curve": float(auc(fpr, tpr)),
         }
 
-    os.makedirs(metric_path, exist_ok=True)
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    axes = axes.ravel()
-    for ax, (name, path) in zip(axes, model_paths.items()):
+    aggregate = scored.filter(pl.col("wsba_xg").is_not_null())
+    output_metrics = {"wsba_xg": metrics_for(aggregate, "wsba_xg")}
+    output_metrics["wsba_xg"].pop("roc_auc_curve", None)
+
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    y = aggregate.get_column(TARGET).to_numpy().astype(np.int8, copy=False)
+    predictions = aggregate.get_column("wsba_xg").to_numpy()
+    fpr, tpr, _ = roc_curve(y, predictions)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f"AUC={auc(fpr, tpr):.4f}")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.title("WSBA xG ROC-AUC")
+    plt.legend()
+    plt.savefig(plot_dir / "wsba_xg_roc_auc.png", bbox_inches="tight")
+    plt.close()
+
+    observed, predicted = calibration_curve(y, predictions, n_bins=20)
+    plt.figure()
+    plt.plot(predicted, observed, "s-")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.title("WSBA xG Calibration")
+    plt.savefig(plot_dir / "wsba_xg_calibration.png", bbox_inches="tight")
+    plt.close()
+
+    for name in names:
+        model_path = Path(model_dir) / f"wsba_xg_model_{name}.json"
+        if not model_path.exists():
+            continue
         model = xgb.Booster()
-        model.load_model(path)
+        model.load_model(str(model_path))
+        model_features = _model_features(model, model_path)
+        importance = [
+            {"feature": model_features[int(feature[1:])] if feature.startswith("f") and feature[1:].isdigit() else feature, "gain": float(gain)}
+            for feature, gain in model.get_score(importance_type="gain").items()
+        ]
+        if importance:
+            importance = sorted(importance, key=lambda item: item["gain"], reverse=True)[:20]
+            plt.figure(figsize=(10, 7))
+            plt.barh([item["feature"] for item in importance][::-1], [item["gain"] for item in importance][::-1])
+            plt.xlabel("Gain")
+            plt.title(f"{name.upper()} Feature Importance")
+            plt.savefig(plot_dir / f"wsba_xg_{name}_feature_importance.png", bbox_inches="tight")
+            plt.close()
 
-        fi = pd.DataFrame(model.get_score(importance_type='gain').items(), columns=['feature','gain']).sort_values("gain", ascending=False).head(20)
-        fi['gain'] /= fi['gain'].sum()
+    Path(plot_dir / "wsba_xg_overall_metrics.json").write_text(json.dumps(output_metrics, indent=2))
+    return output_metrics
 
-        ax.barh(fi['feature'], fi['gain'])
-        ax.invert_yaxis()
-        ax.set_xlabel('Gain')
-        ax.set_title(f'WSBA xG {name.upper()} Feature Importance')
 
-        single_fig, single_ax = plt.subplots(figsize=(10, 7))
-        single_ax.barh(fi['feature'], fi['gain'])
-        single_ax.invert_yaxis()
-        single_ax.set_xlabel('Gain')
-        single_ax.set_title(f'WSBA xG {name.upper()} Feature Importance')
-        single_fig.savefig(os.path.join(metric_path, f'feature_importance_{name}.png'), bbox_inches='tight')
-        plt.close(single_fig)
+model_results = evaluate_xG_models
 
-    for ax in axes[len(model_paths):]:
-        ax.axis('off')
-    fig.tight_layout()
-    fig.savefig(os.path.join(metric_path, 'feature_importance.png'), bbox_inches='tight')
-    plt.close(fig)
 
-def roc_auc_curve(pbp, metric_path = wsba.METRIC_PATH):
-    print('ROC-AUC Curve for WSBA xG Model...')
+def apply_xG(pbp, model_dir=MODEL_DIR):
+    frame, was_pandas = _as_polars(pbp)
+    if "event_index" not in frame.columns:
+        frame = frame.with_row_index("event_index")
+    predictions = score_xG_models(prepare_xG_shots(frame), model_dir=model_dir).select(["event_index", "wsba_xg"])
+    result = frame.join(predictions, on="event_index", how="left").with_columns(pl.col("wsba_xg").fill_null(0.0).alias("xG"))
+    if was_pandas:
+        output = pd.DataFrame(result.to_dicts())
+        output.index = pd.DataFrame(pbp).index
+        return output
+    return result
 
-    if 'xG' in pbp.columns:
-        data = pbp.loc[(pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['strength_state'].isin(wsba.STRENGTHS))&(pbp['x'].notna())&(pbp['y'].notna())].copy()
-        data['is_goal'] = (data['event_type'] == 'goal').astype(int)
-        data['xG'] = pd.to_numeric(data['xG'], errors='coerce').fillna(0.0)
-        empty_mask = data['event_goalie_id'].isna()
-        modeled_mask = (
-            ((~empty_mask) & data['strength_state'].isin(wsba.STRENGTH_GROUPS['even_strength'])) |
-            ((~empty_mask) & data['strength_state'].isin(wsba.STRENGTH_GROUPS['power_play'] + ['6v5', '6v4'])) |
-            ((~empty_mask) & data['strength_state'].isin(wsba.STRENGTH_GROUPS['penalty_kill'])) |
-            empty_mask
-        )
-        data = data.loc[modeled_mask]
-
-        os.makedirs(metric_path, exist_ok=True)
-        plt.figure(figsize=(8, 7))
-        fpr, tpr, _ = roc_curve(data['is_goal'], data['xG'])
-        roc_auc = auc(fpr,tpr)
-        plt.plot(fpr,tpr,label=f"Total (AUC = {roc_auc:.4f})")
-        plt.plot([0, 1], [0, 1], linestyle="--")
-        plt.title(f"WSBA xG ROC Curve")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.legend(loc="lower right")
-        plt.savefig(os.path.join(metric_path, f'roc_auc_curve.png'), bbox_inches='tight')
-        plt.close()
-    else:
-        print('No xG found for provided play-by-play data.  Apply xG model to the play-by-play data first.')
-
-def calibration(pbp, metric_path = wsba.METRIC_PATH):
-    print('Reliability for WSBA xG Model...')
-
-    if 'xG' in pbp.columns: 
-        data = pbp.loc[(pbp['event_type'].isin(wsba.FENWICK_EVENTS))&(pbp['strength_state'].isin(wsba.STRENGTHS))&(pbp['x'].notna())&(pbp['y'].notna())].copy()
-        data['is_goal'] = (data['event_type'] == 'goal').astype(int)
-        data['xG'] = pd.to_numeric(data['xG'], errors='coerce').fillna(0.0).clip(0, 1)
-        empty_mask = data['event_goalie_id'].isna()
-        modeled_mask = (
-            ((~empty_mask) & data['strength_state'].isin(wsba.STRENGTH_GROUPS['even_strength'])) |
-            ((~empty_mask) & data['strength_state'].isin(wsba.STRENGTH_GROUPS['power_play'] + ['6v5', '6v4'])) |
-            ((~empty_mask) & data['strength_state'].isin(wsba.STRENGTH_GROUPS['penalty_kill'])) |
-            empty_mask
-        )
-        data = data.loc[modeled_mask].copy()
-        data['bin'] = pd.cut(data['xG'], bins=np.linspace(0, 1, 21), include_lowest=True, duplicates='drop')
-        curve = data.groupby('bin', observed=True).agg(
-            predicted=('xG', 'mean'),
-            observed=('is_goal', 'mean'),
-            shots=('is_goal', 'size')
-        ).reset_index()
-
-        os.makedirs(metric_path, exist_ok=True)
-        plt.figure(figsize=(8, 7))
-        plt.plot(curve['predicted'], curve['observed'], "s-", label="Total")
-        plt.plot([0, 1], [0, 1], linestyle="--", label="Perfect calibration")
-        plt.title(f"WSBA xG Calibration")
-        plt.xlabel("Predicted Probability (mean)")
-        plt.ylabel("Fraction of positives")
-        plt.legend(loc="best")
-        plt.savefig(os.path.join(metric_path, f'calibration.png'), bbox_inches='tight')
-        plt.close()
-
-    else:
-        print('No xG found for provided play-by-play data.  Apply xG model to the play-by-play data first.')

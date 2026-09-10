@@ -1,0 +1,15 @@
+gspread-pandas
+joblib
+matplotlib
+networkx
+numpy
+pandas
+pillow
+polars
+scikit-learn
+scipy
+sqlalchemy
+torch
+tqdm
+wsba_hockey
+xgboost

@@ -60,13 +60,13 @@ RAPM_CONTEXT_PREDICTORS = {
 XG_FEATURE_NAMES = tuple(wsba.CONTINUOUS + wsba.BOOLEAN)
 XG_FEATURE_INDEX = {name: idx for idx, name in enumerate(XG_FEATURE_NAMES)}
 XG_FEATURE_COUNT = len(XG_FEATURE_NAMES)
-XG_MODEL_DIR = Path(__file__).resolve().parent / 'xg_model'
+XG_MODEL_DIR = Path(__file__).resolve().parent / 'xg_model' / 'models'
 SIM_DATA_DIR = Path(__file__).resolve().parent / 'simulation' / 'sim_data'
 XG_MODEL_FILES = {
-    'ev': 'wsba_xg_ev.json',
-    'pp': 'wsba_xg_pp.json',
-    'pk': 'wsba_xg_pk.json',
-    'en': 'wsba_xg_en.json',
+    'ev': 'wsba_xg_model_ev.json',
+    'pp': 'wsba_xg_model_pp.json',
+    'pk': 'wsba_xg_model_pk.json',
+    'en': 'wsba_xg_model_en.json',
 }
 
 FENWICK_GRID = pd.read_csv(SIM_DATA_DIR / 'league_fenwick_grid.csv')
@@ -195,7 +195,7 @@ def predict_single_shot(feature_dict: dict, empty_net: bool = False, model_path:
 
 def load_team_from_roster_csv(team_abbr, roster_dir=None):
     if roster_dir is None:
-        roster_dir = Path(__file__).resolve().parent / 'simulation' / 'team_data'
+        roster_dir = Path(__file__).resolve().parent / 'simulation' / 'team_data' / 'rosters'
     else:
         roster_dir = Path(roster_dir)
     roster_path = roster_dir / f'{str(team_abbr).lower()}_roster.csv'

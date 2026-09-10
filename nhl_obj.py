@@ -10,6 +10,8 @@ import wsba_hockey as wsba
 ## PLAYER DATA ##
 SEASONS = wsba.SEASON_NAMES.keys()
 ROSTERS = wsba.repo_load_rosters(SEASONS)
+if not isinstance(ROSTERS, pd.DataFrame):
+    ROSTERS = pd.DataFrame(ROSTERS.to_dicts())
 PLAYER_LOOKUP = ROSTERS.drop_duplicates('player_id').set_index('player_id').to_dict('index')
 SIMULATION_NAMES_PATH = Path(__file__).resolve().parent / "simulation" / "sim_data" / "names.csv"
 
@@ -364,14 +366,24 @@ class NHLCoach:
         for column in COACH_SCORE_COLUMNS:
             setattr(self, column, self._select_data(coach_data, column))
         for strength_state, prefix in COACH_SCORE_STRENGTH_PREFIXES.items():
+            # RAPM can arrive either as one row per strength (raw model output)
+            # or as one flattened roster row with explicit ev_/pp_/pk_ aliases.
+            # Prefer the explicit aliases for the flattened form; otherwise the
+            # generic columns would incorrectly be copied into every strength.
+            has_strength_rows = 'strength_state' in coach_data.columns
             strength_data = coach_data
-            if 'strength_state' in strength_data.columns:
+            if has_strength_rows:
                 strength_data = strength_data.loc[strength_data['strength_state'].astype(str).eq(strength_state)]
             for column in COACH_SCORE_COLUMNS:
                 alias = f'{prefix}_{column}'
-                value = self._select_data(strength_data, column, None)
-                if value is None:
-                    value = self._select_data(coach_data, alias)
+                if has_strength_rows:
+                    value = self._select_data(strength_data, column, None)
+                    if value is None:
+                        value = self._select_data(coach_data, alias)
+                else:
+                    value = self._select_data(coach_data, alias, None)
+                    if value is None:
+                        value = self._select_data(coach_data, column)
                 setattr(self, alias, value)
 
 class NHLTeam:

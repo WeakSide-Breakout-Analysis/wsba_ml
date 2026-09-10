@@ -1,5 +1,6 @@
 import pandas as pd
 import wsba_hockey as wsba
+from wsba_ml.wsba_hockey_bridge import nhl_agg_stats_pandas
 from gspread_pandas import Spread
 from wsba_hockey.tools.globals import *
 
@@ -67,7 +68,7 @@ def team_dataset(seasons=DEFAULT_SEASONS, data_path=SENSE_DATA, scrape=False, fo
     return data
 
 def consolidate_dataset(df, seasons=DEFAULT_SEASONS[-3:]):
-    return wsba.nhl_agg_stats(df, ['player_id','position'], params={'time_on_ice': ('>=', 450, 'after'), 'season': ('in', seasons), 'strength_state': ('==', '5v5')})
+    return nhl_agg_stats_pandas(df, ['player_id','position'], params={'time_on_ice': ('>=', 450, 'after'), 'season': ('in', seasons), 'strength_state': ('==', '5v5')})
 
 def combine_datasets(skater, team):
     #Combine skater and team dfs
@@ -182,8 +183,8 @@ def nhl_build_dataset(seasons:int | list, edge:bool = False) -> pd.DataFrame:
     # Aggregate WSBA and A3Z independently
     wsba_stats = wsba_stats.sort_values(by=['player_id','season','game_date','game_id'])
 
-    wsba_stats = wsba.nhl_agg_stats(wsba_stats, manual_agg={'game_date': 'last'})
-    a3z_stats = wsba.nhl_agg_stats(a3z_stats, ['player_id', 'season', 'team_abbr', 'season_type', 'strength_state'])
+    wsba_stats = nhl_agg_stats_pandas(wsba_stats, manual_agg={'game_date': 'last'})
+    a3z_stats = nhl_agg_stats_pandas(a3z_stats, ['player_id', 'season', 'team_abbr', 'season_type', 'strength_state'])
 
     # Merge WSBA + A3Z
     stats = pd.merge(
@@ -205,7 +206,7 @@ def nhl_build_dataset(seasons:int | list, edge:bool = False) -> pd.DataFrame:
     stats['position'] = stats['position'].str[0].map({'C':'F','L':'F', 'R':'F', 'D':'D'})
 
     # Re-aggregate to combine similar strength states (mapped above)
-    stats = wsba.nhl_agg_stats(stats, manual_agg={'game_date': 'last'})
+    stats = nhl_agg_stats_pandas(stats, manual_agg={'game_date': 'last'})
 
     return stats.replace([-np.inf, np.inf], 0)
 

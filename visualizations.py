@@ -17,6 +17,7 @@ from scipy.ndimage import gaussian_filter
 import wsba_hockey as wsba
 from wsba_hockey.tools.plotting import wsba_rink
 from wsba_ml.rapm import MAP_Y, weighted_map, rapm_four_maps
+from wsba_ml.wsba_hockey_bridge import nhl_agg_stats_pandas
 
 
 def _find_workspace_root() -> Path:
@@ -791,7 +792,7 @@ def _aggregate_weighted_features(df: pd.DataFrame) -> pd.DataFrame:
 @lru_cache(maxsize=8)
 def _card_dataset_cached(seasons_key: tuple[int, ...]) -> pd.DataFrame:
     df = _load_hs_dataset_cached(seasons_key)
-    base = wsba.nhl_agg_stats(df[BASE_AGG_COLUMNS], ["player_id"], comparison=False)
+    base = nhl_agg_stats_pandas(df[BASE_AGG_COLUMNS], ["player_id"], comparison=False)
     weighted = _aggregate_weighted_features(df)
 
     summary = (

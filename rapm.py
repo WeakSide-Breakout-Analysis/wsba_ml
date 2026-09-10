@@ -3,6 +3,7 @@ import json
 import zlib
 import pandas as pd
 import numpy as np
+import polars as pl
 import scipy.sparse as sp
 import wsba_hockey as wsba
 import matplotlib.pyplot as plt
@@ -1010,8 +1011,11 @@ def prepare_rapm_data(pbp, strengths=wsba.STRENGTHS, shot=False, include_maps=Tr
                     "Shot RAPM requires passer assist probabilities or the columns needed to impute them. "
                     f"Missing columns: {missing_required_cols}"
                 )
-            from wsba_ml.xg_model import apply_passing_imputation
-            pbp = apply_passing_imputation(pbp)
+            from wsba_hockey.tools.scraping import apply_passing_imputation
+            imputed = apply_passing_imputation(
+                pl.DataFrame(pbp.to_dict(orient='records'), infer_schema_length=None)
+            )
+            pbp = pd.DataFrame(imputed.to_dicts(), index=pbp.index)
 
         pbp[home_cols + away_cols + passer_probability_cols] = pbp[home_cols + away_cols + passer_probability_cols].fillna(0)
 

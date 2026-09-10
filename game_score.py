@@ -2,6 +2,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import wsba_hockey as wsba
+from wsba_ml.wsba_hockey_bridge import nhl_agg_stats_pandas
 import matplotlib.pyplot as plt
 from functools import reduce
 from pathlib import Path
@@ -147,7 +148,7 @@ def prepare_game_score(stats):
             'goals_against',
         ]
 
-        agg = wsba.nhl_agg_stats(str_df[BIO+measures], BIO, rates=False, comparison=False).rename(columns={
+        agg = nhl_agg_stats_pandas(str_df[BIO+measures], BIO, rates=False, comparison=False).rename(columns={
             col: f'{strength}_{col}' for col in measures
         })
 
@@ -180,7 +181,7 @@ def prepare_game_score(stats):
         'faceoff_losses'
     ]
  
-    all_df = wsba.nhl_agg_stats(stats[BIO+measures], BIO, rates=False, comparison=False)
+    all_df = nhl_agg_stats_pandas(stats[BIO+measures], BIO, rates=False, comparison=False)
     df = pd.merge(split_df, all_df[BIO+measures], how='left')
     strength_toi_cols = [f'{strength}_time_on_ice' for strength in wsba.STRENGTH_GROUPS.keys()]
     df['time_on_ice'] = pd.to_numeric(df['time_on_ice'], errors='coerce').fillna(0)
@@ -340,7 +341,7 @@ def calculate_game_score_metrics(gs_stats, group_by=['player_id','season','team_
     
     component_cols = [f'game_score_{component}' for component in GS_MEASURES.keys() if f'game_score_{component}' in gs_stats.columns]
     gs_stats['game_score_consistency'] = gs_stats['game_score']
-    df = wsba.nhl_agg_stats(
+    df = nhl_agg_stats_pandas(
         gs_stats, group_by, manual_agg={
             'game_score_consistency': std
         }, rates=False, comparison=False
