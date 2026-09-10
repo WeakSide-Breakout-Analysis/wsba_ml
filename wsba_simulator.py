@@ -615,7 +615,9 @@ class WSBASimulation:
         away: NHLTeam,
         season_type: int = 2,
         reg_periods: int = 3,
-        reg_minutes: int = 20
+        reg_minutes: int = 20,
+        home_goalie_id: int | None = None,
+        away_goalie_id: int | None = None,
     ):
         ## SIMULATION ENGINE DATA ##
         self.season_type = season_type
@@ -656,8 +658,16 @@ class WSBASimulation:
                 for attribute in SHOT_SAMPLING_ATTRIBUTES
             },
         }
-        self.home_goalie = next((p for p in self.home.active_roster if p.position == 'G'), None)
-        self.away_goalie = next((p for p in self.away.active_roster if p.position == 'G'), None)
+        def _select_goalie(team, goalie_id):
+            goalies = [p for p in team.active_roster if p.position == 'G']
+            if goalie_id is not None:
+                selected = next((p for p in goalies if int(p.player_id) == int(goalie_id)), None)
+                if selected is not None:
+                    return selected
+            return goalies[0] if goalies else None
+
+        self.home_goalie = _select_goalie(self.home, home_goalie_id)
+        self.away_goalie = _select_goalie(self.away, away_goalie_id)
 
         # Combine the team for and against rates (both ways) to find the per-second probabilities of each team recording a fenwick shot or a penalty
         self.ev_corsi_home = self.ev_corsi + (

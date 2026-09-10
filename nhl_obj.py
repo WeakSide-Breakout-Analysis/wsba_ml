@@ -527,11 +527,14 @@ class NHLTeam:
 
             forwards = forwards[:12]
             defensemen = defensemen[:6]
-            goalies = goalies[:1]
+            # Keep both goalies available to the simulator.  The notebook or
+            # caller may select the game starter; the first goalie remains the
+            # default for backwards compatibility.
+            goalies = goalies[:2]
 
             f_minutes = [19, 16, 14, 11]
             d_minutes = [25, 20, 15]
-            g_minutes = [60]
+            g_minutes = [60, 60]
 
             # Build PP/PK units directly
             pp_pool = sorted(self.active_roster if hasattr(self, "active_roster") else forwards + defensemen,
