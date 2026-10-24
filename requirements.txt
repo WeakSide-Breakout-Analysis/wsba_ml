@@ -8,8 +8,11 @@ pillow
 polars
 scikit-learn
 scipy
+scrapy
 sqlalchemy
 torch
 tqdm
 wsba_hockey
 xgboost
+shap
+optuna>=3.6,<5

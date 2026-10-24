@@ -15,5 +15,6 @@ rapm/wsba_rapm_prior.csv
 rapm/plot_feature_coefficients.py
 .freebuff
 .cache
+misc/
 essm.py
 essm

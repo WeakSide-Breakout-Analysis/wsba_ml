@@ -22,11 +22,23 @@ def pandas_to_polars(data):
     if isinstance(data, pl.DataFrame):
         return data
     if isinstance(data, pd.DataFrame):
-        return pl.from_pandas(data, include_index=False)
+        try:
+            return pl.from_pandas(data, include_index=False)
+        except ImportError:
+            # Polars requires PyArrow for pandas extension dtypes.  The
+            # dict route preserves the explicit boundary when PyArrow is not
+            # available in a local development environment.
+            return pl.DataFrame(data.to_dict(orient='list'), strict=False)
     return data
 
 
 def nhl_agg_stats_pandas(data, *args, **kwargs):
     """Run the Polars wsba_hockey aggregator and return a pandas frame."""
     result = wsba.nhl_agg_stats(pandas_to_polars(data), *args, **kwargs)
+    return polars_to_pandas(result)
+
+
+def nhl_calculate_stats_pandas(data, *args, **kwargs):
+    """Run the Polars wsba_hockey calculator on a pandas PBP frame."""
+    result = wsba.nhl_calculate_stats(pandas_to_polars(data), *args, **kwargs)
     return polars_to_pandas(result)

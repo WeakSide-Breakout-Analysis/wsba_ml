@@ -58,6 +58,16 @@ def _sim_positive_value(value, default):
     return numeric
 
 
+def _sim_nonnegative_value(value, default):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(numeric):
+        return float(default)
+    return max(numeric, 0.0)
+
+
 def _sim_probability_value(value, default):
     numeric = _sim_positive_value(value, default)
     if numeric > 1.0 and numeric <= 100.0:
@@ -290,12 +300,12 @@ class NHLPlayer:
                 self._select_data(player_data, 'blocked_shots_per_sixty'),
                 LEAGUE_AVERAGE_SIM_RATES["block_rate"],
             )
-            self.penalties_taken_rate = _sim_positive_value(
-                self._select_data(player_data, 'minor_penalties_per_sixty'),
+            self.penalties_taken_rate = _sim_nonnegative_value(
+                self._select_data(player_data, 'minor_penalties_per_sixty', None),
                 LEAGUE_AVERAGE_SIM_RATES["penalties_taken_rate"],
             )
-            self.penalties_drawn_rate = _sim_positive_value(
-                self._select_data(player_data, 'minor_penalties_drawn_per_sixty'),
+            self.penalties_drawn_rate = _sim_nonnegative_value(
+                self._select_data(player_data, 'minor_penalties_drawn_per_sixty', None),
                 LEAGUE_AVERAGE_SIM_RATES["penalties_drawn_rate"],
             )
             self.giveaways_rate = self._select_data(player_data, 'giveaways_per_sixty')

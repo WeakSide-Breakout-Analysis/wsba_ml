@@ -1,0 +1,67 @@
+{
+  "metrics": {
+    "n_rows": 52561,
+    "n_goals": 3958,
+    "n_games": 627,
+    "roc_auc": 0.7939256531377543,
+    "pr_auc": 0.2891069772638782,
+    "log_loss": 0.22255392574694471,
+    "brier_score": 0.061487852197202,
+    "total_xg": 4100.170292938536,
+    "calibration": 0.9653257589853314,
+    "min_xg": 0.0003575272858142853,
+    "max_xg": 0.9645940065383911,
+    "calibration_bins": [
+      {
+        "mean_predicted": 0.03626027803352937,
+        "observed_goal_rate": 0.03461437908496732,
+        "n_shots": 38250
+      },
+      {
+        "mean_predicted": 0.14067913172571272,
+        "observed_goal_rate": 0.13849604993660392,
+        "n_shots": 10253
+      },
+      {
+        "mean_predicted": 0.23760558845452456,
+        "observed_goal_rate": 0.2194124209743399,
+        "n_shots": 2689
+      },
+      {
+        "mean_predicted": 0.3416157916855456,
+        "observed_goal_rate": 0.3194029850746269,
+        "n_shots": 670
+      },
+      {
+        "mean_predicted": 0.44521788854410155,
+        "observed_goal_rate": 0.47854785478547857,
+        "n_shots": 303
+      },
+      {
+        "mean_predicted": 0.5451542865845465,
+        "observed_goal_rate": 0.5612903225806452,
+        "n_shots": 155
+      },
+      {
+        "mean_predicted": 0.6490929831740677,
+        "observed_goal_rate": 0.5913978494623656,
+        "n_shots": 93
+      },
+      {
+        "mean_predicted": 0.745009704430898,
+        "observed_goal_rate": 0.75,
+        "n_shots": 60
+      },
+      {
+        "mean_predicted": 0.8525008098645643,
+        "observed_goal_rate": 0.8181818181818182,
+        "n_shots": 44
+      },
+      {
+        "mean_predicted": 0.9329843819141388,
+        "observed_goal_rate": 0.9545454545454546,
+        "n_shots": 44
+      }
+    ]
+  }
+}
